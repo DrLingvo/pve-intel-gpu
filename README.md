@@ -32,20 +32,33 @@ LOG_LEVEL=debug ./pve-intel-gpu.sh --mode status
 
 ## ROM-файлы
 
-Скрипты сборки ROM (ссылки на оригинальные репозитории AICodo):
+### Сборка в GitHub Actions
 
-- `roms/build-6-14.sh` — Intel 6–14 поколение
-- `roms/build-ultra.sh` — Intel Ultra
+Добавлен workflow `.github/workflows/build-roms.yml`.
 
-Готовые ROM лучше брать из Releases:
+Запустить вручную:
+1. Зайти в Actions → Build iGPU ROMs
+2. Run workflow
+3. Выбрать `6-14`, `ultra` или `both`
+
+Готовые `.rom` появятся в артефактах запуска.
+
+### Ручная сборка / готовые файлы
+
+Скрипты-ссылки:
+- `roms/build-6-14.sh`
+- `roms/build-ultra.sh`
+
+Или брать готовые из Releases оригинальных репозиториев:
 - https://github.com/AICodo/intel6-14rom/releases
 - https://github.com/AICodo/intel-ultra-rom/releases
 
 ## Статус
 
-Скелет. Детекция и логирование работают, реальная логика vGPU и passthrough — в разработке.
+Скелет + CI для сборки ROM.  
+Реальная логика vGPU и passthrough — в разработке.
 
 ## Источники
 
-- Логика детекции и отката — из старого `pve-vgpu-setup`
+- Детекция и откат — из старого `pve-vgpu-setup`
 - ROM-сборка — из [AICodo/intel6-14rom](https://github.com/AICodo/intel6-14rom) и [AICodo/intel-ultra-rom](https://github.com/AICodo/intel-ultra-rom)
