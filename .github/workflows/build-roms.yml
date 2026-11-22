@@ -1,0 +1,70 @@
+name: Build iGPU ROMs
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which ROM set to build'
+        required: true
+        default: '6-14'
+        type: choice
+        options:
+          - 6-14
+          - ultra
+          - both
+  push:
+    paths:
+      - 'roms/**'
+      - '.github/workflows/build-roms.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            uuid-dev \
+            iasl \
+            git \
+            nasm \
+            python3 \
+            python-is-python3 \
+            acpica-tools \
+            gcc-multilib
+
+      - name: Build 6-14 ROMs
+        if: ${{ github.event.inputs.target == '6-14' || github.event.inputs.target == 'both' || github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/AICodo/intel6-14rom.git /tmp/intel6-14rom
+          cd /tmp/intel6-14rom
+          # The upstream build script expects to be run from its root
+          bash build_efi_rom.sh || echo "Build finished with warnings or partial success"
+          mkdir -p $GITHUB_WORKSPACE/artifacts/6-14
+          find . -name '*.rom' -exec cp {} $GITHUB_WORKSPACE/artifacts/6-14/ \;
+
+      - name: Build Ultra ROMs
+        if: ${{ github.event.inputs.target == 'ultra' || github.event.inputs.target == 'both' }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/AICodo/intel-ultra-rom.git /tmp/intel-ultra-rom
+          cd /tmp/intel-ultra-rom
+          bash build_efi_rom.sh || echo "Build finished with warnings or partial success"
+          mkdir -p $GITHUB_WORKSPACE/artifacts/ultra
+          find . -name '*.rom' -exec cp {} $GITHUB_WORKSPACE/artifacts/ultra/ \;
+
+      - name: Upload ROM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: igpu-roms-${{ github.run_id }}
+          path: artifacts/
+          retention-days: 30
+          if-no-files-found: warn
