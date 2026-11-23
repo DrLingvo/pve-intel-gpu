@@ -1,0 +1,25 @@
+name: tests
+
+# Offline tests and shellcheck on every push and pull request, so a change that
+# breaks the host-tools contract with realpc-clean-build is seen before merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: shellcheck pve-intel-gpu.sh tests/run.sh
+      - name: bios/ checksums
+        run: cd bios && sha256sum -c SHA256SUMS
+      - name: Offline tests
+        run: bash tests/run.sh
