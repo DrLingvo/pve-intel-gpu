@@ -707,7 +707,7 @@ host_passthrough() {
         log_info "Switching host mode vgpu -> passthrough"
         if [[ "$IGPU_NUMVFS" != 0 ]]; then set_numvfs 0 || true; fi
         if [[ -e "$VF_UNIT" ]]; then
-            have systemctl && run systemctl disable "$VF_UNIT_NAME" >/dev/null 2>&1 || true
+            if have systemctl; then run systemctl disable "$VF_UNIT_NAME" >/dev/null 2>&1 || true; fi
             file_del "$VF_UNIT"; UNIT_TOUCHED=1
         fi
         params_remove i915.enable_guc=3 "i915.max_vfs=$(st_get NUMVFS)" module_blacklist=xe
@@ -944,7 +944,7 @@ host_revert() {
     [[ -z "$users" ]] || die "VM(s) $users still use the iGPU/VFs. Run --mode revert --vmid N for each first."
     if [[ "$IGPU_NUMVFS" != 0 ]]; then set_numvfs 0; fi
     if [[ -e "$VF_UNIT" ]]; then
-        have systemctl && run systemctl disable "$VF_UNIT_NAME" >/dev/null 2>&1 || true
+        if have systemctl; then run systemctl disable "$VF_UNIT_NAME" >/dev/null 2>&1 || true; fi
         file_del "$VF_UNIT"; UNIT_TOUCHED=1
         have systemctl && run systemctl daemon-reload
     fi
