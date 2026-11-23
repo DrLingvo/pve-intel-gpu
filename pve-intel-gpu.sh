@@ -12,7 +12,8 @@
 #     "-set device.hostpciN.{addr,bus,x-igd-*}" tokens inside "args:". The rest of
 #     the args line (for example the realpc-clean-build ACPI/SMBIOS profile) is kept;
 #   - never touches kvm*.ko, pve-qemu-kvm, pve-edk2-firmware or APT holds;
-#   - shares the lock /run/lock/pve-host-tools.lock with other host tools.
+#   - shares the lock /run/lock/pve-host-tools.lock and args.d fragments with other
+#     host tools; the rules are in CONTRACT.md.
 # Logging: none / normal / debug. The log file follows the script name.
 
 set -Eeuo pipefail
@@ -37,10 +38,19 @@ VF_UNIT="$ROOT/etc/systemd/system/$VF_UNIT_NAME"
 REALPC_DIR="${REALPC_DIR:-/root/realpc}"
 REALPC_STATE="$ROOT$REALPC_DIR/.realpc-state"
 IGPU_BDF="${IGPU_BDF:-0000:00:02.0}"
+# ROM catalog shipped with the tool in bios/ (PIG_ROMS_DIR overrides it for tests)
+ROMS_DIR="${PIG_ROMS_DIR:-$SCRIPT_DIR/bios}"
+ROM_CATALOG="$ROMS_DIR/catalog.tsv"
+ROM_SUMS="$ROMS_DIR/SHA256SUMS"
+# Shared host-tools contract (see CONTRACT.md): lock + args.d fragments
+CONTRACT_VERSION=1
+ARGS_D="$ROOT/etc/pve-host-tools/args.d"
+ARGS_FRAGMENT_NAME="50-pve-intel-gpu.args"
 AUDIO_BDF="0000:00:1f.3"
 
 # ---------------------------------------------------------------- options
 MODE="check"; VMID=""; VF=""; NUMVFS=""; ROM=""; GMS="0x2"; AUDIO=0
+ROM_IDS=""; ROM_QEMU="10"; ROM_SOURCE=""
 DKMS_DEB=""; YES=0; DRY_RUN=0; FORCE=0
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/${SCRIPT_NAME%.sh}.log}"
@@ -61,18 +71,21 @@ Modes:
   reapply          With --vmid: put our IGD args/vga back (e.g. after realpc configvm)
   revert           With --vmid: remove only our changes from the VM
                    Without:    remove our host changes (VMs must be reverted first)
+  rom-add          Add a ROM to bios/: --rom FILE --ids "46d1 46d0" [--qemu 10] [--source TEXT]
+                   (copies the file, updates bios/SHA256SUMS and bios/catalog.tsv)
 
 Options:
   --vmid N         VM ID
   --vf N           VF number to assign (1..7); default: first free VF
   --vfs N          Number of VFs to create (default: 7, capped by sriov_totalvfs)
-  --rom FILE|NAME  ROM file to copy into /usr/share/kvm, or a name already there
+  --rom FILE|NAME  ROM file (unverified, your choice) or a catalog/kvm name;
+                   default: bios/catalog.tsv by PCI ID, checked against bios/SHA256SUMS
   --gms HEX        x-igd-gms value (default 0x2 = 64 MiB)
   --audio          Also pass the onboard audio $AUDIO_BDF (passthrough)
   --dkms-deb FILE  Install this i915-sriov-dkms .deb if SR-IOV is not available
   --yes            Do not ask for confirmation
   --dry-run        Show what would change, change nothing
-  --force          Skip the QEMU >= 10 check for ROM passthrough
+  --force          Skip the minimum QEMU check and the ROM checksum check
   --log LEVEL      none | normal | debug (also LOG_LEVEL=...)
   --logfile FILE   Log file (default: $LOG_FILE)
   -h, --help       This help;  --version  print version
@@ -98,6 +111,9 @@ parse_args() {
             --gms)      GMS="$(val --gms "${2-}")"; shift 2 ;;
             --audio)    AUDIO=1; shift ;;
             --dkms-deb) DKMS_DEB="$(val --dkms-deb "${2-}")"; shift 2 ;;
+            --ids)      ROM_IDS="$(val --ids "${2-}")"; shift 2 ;;
+            --qemu)     ROM_QEMU="$(val --qemu "${2-}")"; shift 2 ;;
+            --source)   ROM_SOURCE="$(val --source "${2-}")"; shift 2 ;;
             --yes|-y)   YES=1; shift ;;
             --dry-run)  DRY_RUN=1; shift ;;
             --force)    FORCE=1; shift ;;
@@ -109,7 +125,7 @@ parse_args() {
         esac
     done
     [[ "$MODE" == status ]] && MODE=check
-    case "$MODE" in check|prepare|vgpu|passthrough|reapply|revert) ;;
+    case "$MODE" in check|prepare|vgpu|passthrough|reapply|revert|rom-add) ;;
         *) echo "Unknown mode: $MODE (see --help)" >&2; exit 2 ;; esac
     case "$LOG_LEVEL" in none|normal|debug) ;;
         *) echo "--log must be none, normal or debug" >&2; exit 2 ;; esac
@@ -118,6 +134,11 @@ parse_args() {
     [[ -z "$NUMVFS" || "$NUMVFS" =~ ^[1-9][0-9]*$ ]] || { echo "--vfs must be a positive number" >&2; exit 2; }
     [[ "$GMS" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "--gms must be hex, e.g. 0x2" >&2; exit 2; }
     if [[ "$MODE" == reapply && -z "$VMID" ]]; then echo "reapply needs --vmid" >&2; exit 2; fi
+    if [[ "$MODE" == rom-add ]]; then
+        [[ -n "$ROM" && -n "$ROM_IDS" ]] || { echo "rom-add needs --rom FILE and --ids \"46d1 46d0\"" >&2; exit 2; }
+        [[ "$ROM_IDS" =~ ^[0-9a-fA-F\ ]+$ ]] || { echo "--ids: hex PCI device ID prefixes separated by spaces" >&2; exit 2; }
+        [[ "$ROM_QEMU" =~ ^[0-9]+$ ]] || { echo "--qemu must be a number" >&2; exit 2; }
+    fi
     return 0
 }
 
@@ -172,7 +193,7 @@ take_lock() {
     mkdir -p "$(dirname "$LOCK_FILE")"
     exec {LOCK_FD}>"$LOCK_FILE"
     if have flock; then
-        flock -w 60 "$LOCK_FD" || die "Another host tool holds $LOCK_FILE (realpc-setup? another run?)"
+        flock -w "${PIG_LOCK_TIMEOUT:-60}" "$LOCK_FD" || die "Another host tool holds $LOCK_FILE (realpc-setup? another run?)"
     fi
     log_debug "Lock taken: $LOCK_FILE"
 }
@@ -323,7 +344,7 @@ detect_versions() {
 }
 
 # Fills IGPU_* from sysfs. Generation by PCI device ID (prefix table).
-IGPU_PRESENT=0; IGPU_DID=""; IGPU_NAME="not found"; IGPU_FAMILY=none; IGPU_GENS=""
+IGPU_PRESENT=0; IGPU_DID=""; IGPU_NAME="not found"; IGPU_GENS=""
 IGPU_XE=0; IGPU_DRIVER=none; IGPU_TOTALVFS=0; IGPU_NUMVFS=0
 detect_igpu() {
     local dev="$SYS_PCI/$IGPU_BDF" vendor class
@@ -336,48 +357,63 @@ detect_igpu() {
     if [[ -L "$dev/driver" ]]; then IGPU_DRIVER="$(basename "$(readlink "$dev/driver")")"; else IGPU_DRIVER=none; fi
     IGPU_TOTALVFS="$(readf "$dev/sriov_totalvfs")"; [[ "$IGPU_TOTALVFS" =~ ^[0-9]+$ ]] || IGPU_TOTALVFS=0
     IGPU_NUMVFS="$(readf "$dev/sriov_numvfs")"; [[ "$IGPU_NUMVFS" =~ ^[0-9]+$ ]] || IGPU_NUMVFS=0
-    # family: rom set; gens: generation numbers as they appear in CPU names
+    # name + generation numbers as they appear in CPU names (ROM choice: bios/catalog.tsv)
     case "$IGPU_DID" in
-        0f3?)            IGPU_NAME="Bay Trail (Atom)";            IGPU_FAMILY=core;  IGPU_GENS="" ;;
-        04??|0a??|0d??)  IGPU_NAME="Haswell (4th gen)";           IGPU_FAMILY=core;  IGPU_GENS="4" ;;
-        16??|22b?)       IGPU_NAME="Broadwell/Braswell (5th gen)"; IGPU_FAMILY=core; IGPU_GENS="5" ;;
-        19??)            IGPU_NAME="Skylake (6th gen)";           IGPU_FAMILY=core;  IGPU_GENS="6" ;;
-        5a8?)            IGPU_NAME="Apollo Lake (Atom/Celeron)";  IGPU_FAMILY=core;  IGPU_GENS="" ;;
-        59??|87c0)       IGPU_NAME="Kaby/Amber Lake (7th-8th gen)"; IGPU_FAMILY=core; IGPU_GENS="7 8" ;;
-        318?)            IGPU_NAME="Gemini Lake (Celeron/Pentium)"; IGPU_FAMILY=core; IGPU_GENS="" ;;
-        3e??|87ca)       IGPU_NAME="Coffee Lake (8th-9th gen)";   IGPU_FAMILY=core;  IGPU_GENS="8 9" ;;
-        9b??)            IGPU_NAME="Comet Lake (10th gen)";       IGPU_FAMILY=core;  IGPU_GENS="10" ;;
-        8a??)            IGPU_NAME="Ice Lake (10th gen)";         IGPU_FAMILY=core;  IGPU_GENS="10" ;;
-        4e??)            IGPU_NAME="Jasper Lake (Celeron/Pentium)"; IGPU_FAMILY=core; IGPU_GENS="" ;;
-        45??)            IGPU_NAME="Elkhart Lake (Atom/Celeron)"; IGPU_FAMILY=core;  IGPU_GENS="" ;;
-        9a??)            IGPU_NAME="Tiger Lake (11th gen)";       IGPU_FAMILY=core;  IGPU_GENS="11"; IGPU_XE=1 ;;
-        4c??)            IGPU_NAME="Rocket Lake (11th gen)";      IGPU_FAMILY=core;  IGPU_GENS="11"; IGPU_XE=1 ;;
-        46d?)            IGPU_NAME="Alder Lake-N (N-series)";     IGPU_FAMILY=core;  IGPU_GENS="";   IGPU_XE=1 ;;
-        46??)            IGPU_NAME="Alder Lake (12th gen)";       IGPU_FAMILY=core;  IGPU_GENS="12"; IGPU_XE=1 ;;
-        a7??)            IGPU_NAME="Raptor Lake (13th-14th gen)"; IGPU_FAMILY=core;  IGPU_GENS="13 14"; IGPU_XE=1 ;;
-        7d??)            IGPU_NAME="Meteor/Arrow Lake (Core Ultra 1-2)"; IGPU_FAMILY=ultra; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
-        64??)            IGPU_NAME="Lunar Lake (Core Ultra 200V)"; IGPU_FAMILY=unsupported; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
-        b0??)            IGPU_NAME="Panther Lake (Core Ultra 3)"; IGPU_FAMILY=unsupported; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
-        *)               IGPU_NAME="unknown Intel GPU";           IGPU_FAMILY=unsupported; IGPU_GENS="" ;;
+        0f3?)            IGPU_NAME="Bay Trail (Atom)"; IGPU_GENS="" ;;
+        04??|0a??|0d??)  IGPU_NAME="Haswell (4th gen)"; IGPU_GENS="4" ;;
+        16??|22b?)       IGPU_NAME="Broadwell/Braswell (5th gen)"; IGPU_GENS="5" ;;
+        19??)            IGPU_NAME="Skylake (6th gen)"; IGPU_GENS="6" ;;
+        5a8?)            IGPU_NAME="Apollo Lake (Atom/Celeron)"; IGPU_GENS="" ;;
+        59??|87c0)       IGPU_NAME="Kaby/Amber Lake (7th-8th gen)"; IGPU_GENS="7 8" ;;
+        318?)            IGPU_NAME="Gemini Lake (Celeron/Pentium)"; IGPU_GENS="" ;;
+        3e??|87ca)       IGPU_NAME="Coffee Lake (8th-9th gen)"; IGPU_GENS="8 9" ;;
+        9b??)            IGPU_NAME="Comet Lake (10th gen)"; IGPU_GENS="10" ;;
+        8a??)            IGPU_NAME="Ice Lake (10th gen)"; IGPU_GENS="10" ;;
+        4e??)            IGPU_NAME="Jasper Lake (Celeron/Pentium)"; IGPU_GENS="" ;;
+        45??)            IGPU_NAME="Elkhart Lake (Atom/Celeron)"; IGPU_GENS="" ;;
+        9a??)            IGPU_NAME="Tiger Lake (11th gen)"; IGPU_GENS="11"; IGPU_XE=1 ;;
+        4c??)            IGPU_NAME="Rocket Lake (11th gen)"; IGPU_GENS="11"; IGPU_XE=1 ;;
+        46d?)            IGPU_NAME="Alder Lake-N (N-series)"; IGPU_GENS="";   IGPU_XE=1 ;;
+        46??)            IGPU_NAME="Alder Lake (12th gen)"; IGPU_GENS="12"; IGPU_XE=1 ;;
+        a7??)            IGPU_NAME="Raptor Lake (13th-14th gen)"; IGPU_GENS="13 14"; IGPU_XE=1 ;;
+        7d??)            IGPU_NAME="Meteor/Arrow Lake (Core Ultra 1-2)"; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
+        64??)            IGPU_NAME="Lunar Lake (Core Ultra 200V)"; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
+        b0??)            IGPU_NAME="Panther Lake (Core Ultra 3)"; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
+        *)               IGPU_NAME="unknown Intel GPU"; IGPU_GENS="" ;;
     esac
     log_debug "iGPU $IGPU_BDF 8086:$IGPU_DID $IGPU_NAME driver=$IGPU_DRIVER vfs=$IGPU_NUMVFS/$IGPU_TOTALVFS"
 }
 
-default_rom() {
-    case "$IGPU_FAMILY" in
-        core)  echo "6-14-qemu10.rom" ;;
-        ultra) echo "ultra-1-2-qemu10.rom" ;;
-        *)     echo "" ;;
-    esac
+# catalog_lookup DID -> "rom<TAB>min_qemu" of the longest matching ID prefix
+catalog_lookup() {
+    local did=$1
+    [[ -f "$ROM_CATALOG" ]] || return 0
+    awk -F'\t' -v d="$did" '
+        /^[[:space:]]*(#|$)/ { next }
+        { p = tolower($1); if (index(d, p) == 1 && length(p) > best) { best = length(p); r = $2 "\t" ($3 == "" ? 10 : $3) } }
+        END { if (best) print r }' "$ROM_CATALOG"
+}
+default_rom() { catalog_lookup "$IGPU_DID" | cut -f1; }
+rom_min_qemu() {   # by ROM name, from the catalog (default 10)
+    local q
+    q="$(awk -F'\t' -v n="$1" '!/^[[:space:]]*#/ && $2 == n && $3 != "" { print $3; exit }' "$ROM_CATALOG" 2>/dev/null)"
+    echo "${q:-10}"
+}
+rom_expected_sum() { awk -v n="$1" '{ f = $2; sub(/^\*/, "", f) } f == n { print $1; exit }' "$ROM_SUMS" 2>/dev/null; }
+rom_sum_state() {   # FILE NAME -> ok | mismatch | unlisted
+    local want; want="$(rom_expected_sum "$2")"
+    [[ -n "$want" ]] || { echo unlisted; return 0; }
+    if [[ "$(sha256sum "$1" | cut -d' ' -f1)" == "$want" ]]; then echo ok; else echo mismatch; fi
 }
 
-REALPC=0; REALPC_MODE=""; REALPC_KERNEL=""; REALPC_TAG=""
+REALPC=0; REALPC_MODE=""; REALPC_KERNEL=""; REALPC_TAG=""; REALPC_CONTRACT=""
 detect_realpc() {
     [[ -f "$REALPC_STATE" ]] || return 0
     REALPC=1
     REALPC_MODE="$(sed -n 's/^INSTALL_MODE=//p' "$REALPC_STATE" | tail -n1)"
     REALPC_KERNEL="$(sed -n 's/^KERNEL_RELEASE=//p' "$REALPC_STATE" | tail -n1)"
     REALPC_TAG="$(sed -n 's/^RELEASE_TAG=//p' "$REALPC_STATE" | tail -n1)"
+    REALPC_CONTRACT="$(sed -n 's/^CONTRACT_VERSION=//p' "$REALPC_STATE" | tail -n1)"
 }
 
 secure_boot_on() {
@@ -695,31 +731,72 @@ EOF
 # ---------------------------------------------------------------- ROM
 rom_valid() { [[ "$(head -c2 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" == 55aa ]]; }
 
-# sets ROM_NAME (relative to /usr/share/kvm); copies the file there if needed
-ROM_NAME=""; ROM_SRC=""
-# resolve_rom: find the ROM without changing anything (sets ROM_NAME / ROM_SRC)
+# resolve_rom: find the ROM without changing anything.
+# Sets ROM_NAME (relative to /usr/share/kvm), ROM_SRC (file to install, may be
+# empty when the ROM is already there) and ROM_MINQEMU.
+ROM_NAME=""; ROM_SRC=""; ROM_MINQEMU=10
 resolve_rom() {
-    local name src=""
-    if [[ -n "$ROM" && -f "$ROM" ]]; then src="$ROM"; name="$(basename "$ROM")"
+    local name src="" st
+    if [[ -n "$ROM" && -f "$ROM" ]]; then
+        src="$ROM"; name="$(basename "$ROM")"
+        rom_valid "$src" || die "$src is not a PCI option ROM (no 55AA signature)"
+        log_warn "ROM $src was given explicitly: its checksum is not verified (add it with --mode rom-add to verify)"
     else
         name="${ROM:-$(default_rom)}"
-        [[ -n "$name" ]] || die "No ROM known for $IGPU_NAME (8086:$IGPU_DID). Pass --rom FILE."
+        [[ -n "$name" ]] || die "No ROM in ${ROM_CATALOG} for $IGPU_NAME (8086:$IGPU_DID). Add one: --mode rom-add --rom FILE --ids $IGPU_DID"
         [[ "$name" != */* ]] || die "No such ROM file: $name"
-        if [[ ! -f "$KVM_ROM_DIR/$name" ]]; then
-            if [[ -f "$SCRIPT_DIR/roms/$name" ]]; then src="$SCRIPT_DIR/roms/$name"
-            else
-                local repo=intel6-14rom; [[ "$IGPU_FAMILY" == ultra ]] && repo=intel-ultra-rom
-                die "ROM $name not found in ${KVM_ROM_DIR#"$ROOT"} or $SCRIPT_DIR/roms. Take it from the 'Build iGPU ROMs' workflow artifacts or https://github.com/AICodo/$repo/releases and pass --rom FILE."
-            fi
+        if [[ -f "$ROMS_DIR/$name" ]]; then src="$ROMS_DIR/$name"
+        elif [[ ! -f "$KVM_ROM_DIR/$name" ]]; then
+            die "ROM $name is in the catalog but neither in $ROMS_DIR nor in ${KVM_ROM_DIR#"$ROOT"}"
         fi
+        local file="${src:-$KVM_ROM_DIR/$name}"
+        rom_valid "$file" || die "$file is not a PCI option ROM (no 55AA signature)"
+        st="$(rom_sum_state "$file" "$name")"
+        case "$st" in
+            ok) log_debug "ROM $name: checksum OK" ;;
+            mismatch) [[ "$FORCE" == 1 ]] || die "ROM $file does not match $ROM_SUMS (use --force to override)"
+                      log_warn "ROM $file does not match $ROM_SUMS - used because of --force" ;;
+            unlisted) [[ "$FORCE" == 1 ]] || die "ROM $name is not listed in $ROM_SUMS (add it with --mode rom-add, or --force)"
+                      log_warn "ROM $name is not in $ROM_SUMS - used because of --force" ;;
+        esac
     fi
-    if [[ -n "$src" ]]; then rom_valid "$src" || die "$src is not a PCI option ROM (no 55AA signature)"
-    else rom_valid "$KVM_ROM_DIR/$name" || die "${KVM_ROM_DIR#"$ROOT"}/$name is not a PCI option ROM"; fi
-    ROM_NAME="$name"; ROM_SRC="$src"
+    ROM_NAME="$name"; ROM_SRC="$src"; ROM_MINQEMU="$(rom_min_qemu "$name")"
+}
+
+# rom-add: copy a ROM into bios/, record its checksum and the PCI IDs it serves
+mode_rom_add() {
+    local name want id tmp
+    [[ -f "$ROM" ]] || die "No such file: $ROM"
+    rom_valid "$ROM" || die "$ROM is not a PCI option ROM (no 55AA signature)"
+    name="$(basename "$ROM")"
+    [[ "$name" =~ ^[A-Za-z0-9._+-]+$ ]] || die "ROM file name must be simple (letters, digits, . _ + -)"
+    want="$(sha256sum "$ROM" | cut -d' ' -f1)"
+    mkdir -p "$ROMS_DIR"
+    if [[ "$(realpath "$ROM")" != "$(realpath -m "$ROMS_DIR/$name")" ]]; then
+        if [[ -f "$ROMS_DIR/$name" ]] && ! cmp -s "$ROM" "$ROMS_DIR/$name"; then
+            confirm "$ROMS_DIR/$name exists and differs. Replace it?" || exit 1
+        fi
+        run cp -f "$ROM" "$ROMS_DIR/$name"
+    fi
+    tmp="$(mktemp)"
+    { awk -v n="$name" '{ f = $2; sub(/^\*/, "", f) } f != n' "$ROM_SUMS" 2>/dev/null; printf '%s  %s\n' "$want" "$name"; } \
+        | sort -k2 >"$tmp"
+    if [[ "$DRY_RUN" == 1 ]]; then echo "[dry-run] $ROM_SUMS: $want  $name" >&2; else cat "$tmp" >"$ROM_SUMS"; fi
+    [[ -f "$ROM_CATALOG" ]] || printf '# PCI device ID prefix\tROM\tmin QEMU\tsource\n' >"$ROM_CATALOG"
+    for id in $ROM_IDS; do
+        id="${id,,}"
+        awk -F'\t' -v i="$id" '!/^[[:space:]]*#/ && tolower($1) == i' "$ROM_CATALOG" | grep -q . \
+            && { awk -F'\t' -v i="$id" '/^[[:space:]]*#/ || tolower($1) != i' "$ROM_CATALOG" >"$tmp"
+                 [[ "$DRY_RUN" == 1 ]] || cat "$tmp" >"$ROM_CATALOG"; }
+        if [[ "$DRY_RUN" == 1 ]]; then echo "[dry-run] $ROM_CATALOG: $id -> $name" >&2
+        else printf '%s\t%s\t%s\t%s\n' "$id" "$name" "$ROM_QEMU" "${ROM_SOURCE:-added $(date +%F)}" >>"$ROM_CATALOG"; fi
+    done
+    rm -f "$tmp"
+    log_ok "ROM $name added (sha256 $want) for IDs: $ROM_IDS"
 }
 
 ensure_rom() {
-    resolve_rom
+    [[ -n "$ROM_NAME" ]] || resolve_rom
     local name="$ROM_NAME" src="$ROM_SRC" dst owned
     dst="$KVM_ROM_DIR/$name"
     if [[ -n "$src" ]]; then
@@ -742,13 +819,13 @@ vm_passthrough_precheck() {
     local vmid=$1 i
     vm_config "$vmid" >/dev/null
     [[ "$(vm_get "$vmid" bios)" == ovmf ]] || die "VM $vmid uses SeaBIOS. The ROM needs OVMF (bios: ovmf + efidisk). Changing it would break an installed guest, so do it yourself first."
-    if [[ "$QEMU_MAJOR" -lt 10 && "$FORCE" != 1 ]]; then
-        die "QEMU $QEMU_VERSION: the AICodo ROMs need QEMU >= 10 (PVE 9). Use --force to try anyway."
-    fi
     for i in $(seq 1 7); do
         [[ -z "$(vm_hostpci_for "$vmid" "${IGPU_BDF%.*}.$i")" ]] || die "VM $vmid has a vGPU VF. Revert it first (--mode revert --vmid $vmid)."
     done
     resolve_rom
+    if [[ "$QEMU_MAJOR" -lt "$ROM_MINQEMU" && "$FORCE" != 1 ]]; then
+        die "QEMU $QEMU_VERSION: ROM $ROM_NAME needs QEMU >= $ROM_MINQEMU. Use --force to try anyway."
+    fi
 }
 
 vm_passthrough() {
@@ -785,6 +862,9 @@ vm_passthrough() {
     # args: replace only our tokens, keep the rest (realpc ACPI/SMBIOS, user tokens)
     local frag; frag="$(igd_tokens "$idx" "$q35")"
     vm_st_put "$vmid" args "$frag"
+    # contract: the same fragment in the shared args.d, so other tools that
+    # rebuild the args line (realpc configvm) keep it
+    [[ "$DRY_RUN" == 1 ]] || file_put "$ARGS_D/$vmid/$ARGS_FRAGMENT_NAME" <<<"$frag"
     args="$(strip_igd_tokens "$(vm_get "$vmid" args)" "$idx")"
     new="${args:+$args }$frag"
     vm_set "$vmid" args "$new"
@@ -800,6 +880,7 @@ vm_reapply() {
     args="$(strip_igd_tokens "$(vm_get "$vmid" args)" "$idx")"
     vm_set "$vmid" args "${args:+$args }$frag"
     vm_set "$vmid" vga none
+    [[ "$DRY_RUN" == 1 ]] || file_put "$ARGS_D/$vmid/$ARGS_FRAGMENT_NAME" <<<"$frag"
     log_ok "VM $vmid: IGD args and vga reapplied"
 }
 
@@ -851,6 +932,7 @@ vm_revert() {
     fi
     local d; d="$(vm_state_dir "$vmid")"
     local f; for f in hostpci hostpci_audio vga args; do file_del "$d/$f"; done
+    file_del "$ARGS_D/$vmid/$ARGS_FRAGMENT_NAME"
     log_ok "VM $vmid: our changes removed"
 }
 
@@ -920,7 +1002,17 @@ mode_check() {
     if [[ "$IGPU_PRESENT" != 1 ]]; then _ck WARN "No Intel display device at $IGPU_BDF"
     else
         _ck OK "8086:$IGPU_DID $IGPU_NAME, driver: $IGPU_DRIVER"
-        _ck "" "ROM for passthrough: $(default_rom | grep . || echo 'none known')"
+        local rn rf; rn="$(default_rom)"
+        if [[ -z "$rn" ]]; then _ck WARN "ROM for passthrough: none in catalog (--mode rom-add)"
+        else
+            rf="$ROMS_DIR/$rn"; [[ -f "$rf" ]] || rf="$KVM_ROM_DIR/$rn"
+            if [[ ! -f "$rf" ]]; then _ck WARN "ROM $rn: file missing"
+            else case "$(rom_sum_state "$rf" "$rn")" in
+                ok) _ck OK "ROM $rn (QEMU >= $(rom_min_qemu "$rn")), checksum OK" ;;
+                mismatch) _ck WARN "ROM $rn: checksum MISMATCH with bios/SHA256SUMS" ;;
+                *) _ck WARN "ROM $rn: not listed in bios/SHA256SUMS" ;;
+            esac; fi
+        fi
         if [[ "$IGPU_TOTALVFS" -gt 0 ]]; then _ck OK "SR-IOV: $IGPU_NUMVFS of $IGPU_TOTALVFS VFs enabled"
         elif [[ "$IGPU_XE" == 1 ]]; then _ck "" "SR-IOV: not available with the current driver (i915-sriov-dkms: $(dkms_sriov_state))"
         else _ck "" "SR-IOV: not supported by this generation"; fi
@@ -933,6 +1025,9 @@ mode_check() {
             _ck WARN "kvm.ko built for $REALPC_KERNEL, running $KERNEL: run realpc-setup.sh --mode update"
         fi
         apt-mark showhold 2>/dev/null | grep -q '^pve-qemu-kvm$' && _ck OK "pve-qemu-kvm is held (this tool never upgrades it)"
+        if [[ "$REALPC_CONTRACT" == "$CONTRACT_VERSION" ]]; then _ck OK "host-tools contract v$CONTRACT_VERSION: configvm keeps our args and vga"
+        elif [[ -z "$REALPC_CONTRACT" ]]; then _ck WARN "realpc without the host-tools contract: after every configvm run --mode reapply --vmid N"
+        else _ck WARN "realpc contract v$REALPC_CONTRACT, ours v$CONTRACT_VERSION: update the older tool"; fi
     else _ck "" "not installed"; fi
 
     echo "VMs"
@@ -974,6 +1069,7 @@ main() {
     detect_realpc
 
     if [[ "$MODE" == check ]]; then mode_check; return 0; fi
+    if [[ "$MODE" == rom-add ]]; then mode_rom_add; return 0; fi
 
     need_root
     have qm || [[ -n "$ROOT" ]] || die "qm not found - this is not a Proxmox VE host"
@@ -988,6 +1084,7 @@ main() {
 
     if [[ "$MODE" == passthrough && -n "$VMID" ]]; then vm_passthrough_precheck "$VMID"; fi
     txn_begin
+    st_set CONTRACT_VERSION "$CONTRACT_VERSION"
     case "$MODE" in
         prepare)     host_prepare ;;
         vgpu)        host_vgpu

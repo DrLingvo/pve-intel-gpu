@@ -81,7 +81,8 @@ elif a[0] == "set":
     open(p, "w").write("\n".join(lines).strip("\n") + "\n")
 EOF
     chmod +x "$B"/*
-    export PATH="$B:$PATH" PIG_ROOT="$R" LOG_LEVEL=normal LOG_FILE="$W/tool.log"
+    mkdir -p "$W/bios"; printf '# test catalog\n' >"$W/bios/catalog.tsv"; : >"$W/bios/SHA256SUMS"
+    export PATH="$B:$PATH" PIG_ROOT="$R" LOG_LEVEL=normal LOG_FILE="$W/tool.log" PIG_ROMS_DIR="$W/bios"
     unset QM_FAIL_KEY APT_SIM_BAD QEMU_VER
 }
 teardown() { rm -rf "$W"; }
@@ -99,7 +100,7 @@ hosttree() { (cd "$R" && find etc usr var -type f -exec sha256sum {} + 2>/dev/nu
 
 # ---------------------------------------------------------------- tests
 T="check-detects-generation"; setup
-out="$(tool --mode status)"; rc=$?
+out="$(PIG_ROMS_DIR="$HERE/../bios" tool --mode status)"; rc=$?
 assert_eq "$rc" 0
 assert_contains "$out" "Alder Lake (12th gen)"
 assert_contains "$out" "6-14-qemu10.rom"
@@ -298,9 +299,218 @@ T="precheck-before-host-changes"; setup
 mkvm 100 ovmf q35 vmware
 before="$(hosttree)"
 tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 1
-assert_contains "$(cat "$W/err")" "not found"
+assert_contains "$(cat "$W/err")" "No ROM in"
 assert_not "$(cat "$W/err")" "rolling back" "nothing to roll back"
 assert_eq "$(hosttree)" "$before"
+teardown
+
+# ---------------------------------------------------------------- ROM catalog
+catrom() {   # name prefix [minqemu] [listed=1]: put a ROM into the test bios/ dir
+    mkrom "$1"; mv "$W/$1" "$W/bios/$1"
+    printf '%s\t%s\t%s\ttest\n' "$2" "$1" "${3:-10}" >>"$W/bios/catalog.tsv"
+    [[ "${4:-1}" == 1 ]] && (cd "$W/bios" && sha256sum "$1" >>SHA256SUMS)
+    return 0
+}
+
+T="catalog-verified-rom"; setup
+mkvm 100 ovmf q35 vmware; catrom a.rom 46; catrom b.rom 4680
+tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_eq "$(key 100 hostpci0)" "0000:00:02.0,romfile=b.rom" "longest prefix wins"
+assert_eq "$(sha256sum <"$R/usr/share/kvm/b.rom")" "$(sha256sum <"$W/bios/b.rom")"
+assert_contains "$(tool --mode check)" "ROM b.rom (QEMU >= 10), checksum OK"
+teardown
+
+T="catalog-mismatch-and-force"; setup
+mkvm 100 ovmf q35 vmware; catrom a.rom 46; printf 'x' >>"$W/bios/a.rom"
+tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "does not match"
+assert_nofile "$R/usr/share/kvm/a.rom"
+assert_contains "$(tool --mode check)" "MISMATCH"
+tool --mode passthrough --vmid 100 --yes --force; assert_eq "$?" 0
+assert_contains "$(cat "$W/err")" "because of --force"
+teardown
+
+T="catalog-unlisted-rom"; setup
+mkvm 100 ovmf q35 vmware; catrom a.rom 46 10 0
+tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "not listed"
+teardown
+
+T="catalog-min-qemu"; setup
+mkvm 100 ovmf q35 vmware; catrom a.rom 46 11
+QEMU_VER=10.1.2-1 tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "needs QEMU >= 11"
+QEMU_VER=11.0.0-1 tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 0
+teardown
+
+T="catalog-installed-rom-verified"; setup
+mkvm 100 ovmf q35 vmware; catrom a.rom 46; mv "$W/bios/a.rom" "$R/usr/share/kvm/a.rom"
+tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 0 "ROM already in /usr/share/kvm and matches"
+printf 'x' >>"$R/usr/share/kvm/a.rom"; tool --mode revert --vmid 100 --yes
+tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 1 "tampered installed ROM refused"
+teardown
+
+T="rom-add"; setup
+mkvm 100 ovmf q35 vmware; mkrom n100.rom
+tool --mode rom-add --rom "$W/n100.rom" --ids "4680 46D1" --qemu 10 --source "my build"; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_file "$W/bios/n100.rom"
+assert_contains "$(cat "$W/bios/SHA256SUMS")" "$(sha256sum <"$W/n100.rom" | cut -d' ' -f1)  n100.rom"
+assert_contains "$(cat "$W/bios/catalog.tsv")" "$(printf '46d1\tn100.rom\t10\tmy build')"
+tool --mode passthrough --vmid 100 --yes; assert_eq "$(key 100 hostpci0)" "0000:00:02.0,romfile=n100.rom"
+mkrom n100v2.rom; tool --mode rom-add --rom "$W/n100v2.rom" --ids 4680
+assert_eq "$(grep -c '^4680' "$W/bios/catalog.tsv")" 1 "same ID replaced, not duplicated"
+tool --mode rom-add --rom "$W/n100.rom"; assert_eq "$?" 2 "needs --ids"
+printf 'MZ' >"$W/bad.rom"; tool --mode rom-add --rom "$W/bad.rom" --ids 46; assert_eq "$?" 1
+teardown
+
+T="explicit-rom-bad-signature"; setup
+mkvm 100 ovmf q35 vmware; printf 'MZxxxx' >"$W/bad.rom"
+tool --mode passthrough --vmid 100 --rom "$W/bad.rom" --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "55AA"
+teardown
+
+T="unsupported-generation-no-rom"; setup
+echo 0x64a0 >"$R/sys/bus/pci/devices/0000:00:02.0/device"; catrom a.rom 46
+mkvm 100 ovmf q35 vmware
+tool --mode passthrough --vmid 100 --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "rom-add --rom FILE --ids 64a0"
+assert_contains "$(tool --mode check)" "Lunar Lake"
+teardown
+
+T="repo-bios-consistent"; setup
+BD="$HERE/../bios"
+(cd "$BD" && sha256sum -c --quiet SHA256SUMS) >/dev/null 2>&1; assert_eq "$?" 0 "bios/SHA256SUMS matches the files"
+for f in "$BD"/*.rom; do
+    n="$(basename "$f")"
+    grep -q "  $n$" "$BD/SHA256SUMS" && ok || bad "$n not in SHA256SUMS"
+    [[ "$(head -c2 "$f" | od -An -tx1 | tr -d ' \n')" == 55aa ]] && ok || bad "$n has no 55AA"
+done
+while IFS=$'\t' read -r id n q _; do
+    [[ "$id" == \#* || -z "$id" ]] && continue
+    [[ -f "$BD/$n" ]] && ok || bad "catalog ROM $n missing"
+    [[ "$id" =~ ^[0-9a-f]+$ && "$q" =~ ^[0-9]+$ ]] && ok || bad "bad catalog line: $id $n $q"
+done <"$BD/catalog.tsv"
+teardown
+
+# ---------------------------------------------------------------- contract
+T="args-d-fragment"; setup
+mkvm 100 ovmf q35 vmware "$REALPC_ARGS"; mkrom r.rom
+tool --mode passthrough --vmid 100 --rom "$W/r.rom" --yes
+frag="$R/etc/pve-host-tools/args.d/100/50-pve-intel-gpu.args"
+assert_file "$frag"
+assert_contains "$(key 100 args)" "$(cat "$frag")" "fragment equals what is in args"
+assert_not "$(cat "$frag")" "acpitable" "fragment holds only our tokens"
+tool --mode revert --vmid 100 --yes
+assert_nofile "$frag"
+assert_eq "$(grep -c CONTRACT_VERSION=1 "$R/var/lib/pve-intel-gpu/state")" 1
+teardown
+
+T="realpc-contract-report"; setup
+echo "INSTALL_MODE=strong" >"$R/root/realpc/.realpc-state"
+assert_contains "$(tool --mode check)" "without the host-tools contract"
+echo "CONTRACT_VERSION=1" >>"$R/root/realpc/.realpc-state"
+assert_contains "$(tool --mode check)" "contract v1: configvm keeps"
+echo "CONTRACT_VERSION=2" >>"$R/root/realpc/.realpc-state"
+assert_contains "$(tool --mode check)" "update the older tool"
+teardown
+
+T="lock-contention"; setup
+mkdir -p "$R/run/lock"
+( exec 9>"$R/run/lock/pve-host-tools.lock"; flock 9; sleep 4 ) &
+sleep 0.5
+PIG_LOCK_TIMEOUT=1 tool --mode prepare --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "holds"
+wait
+tool --mode prepare --yes; assert_eq "$?" 0 "lock free again"
+teardown
+
+# ---------------------------------------------------------------- vGPU edge paths
+vfhost() { local d="$R/sys/bus/pci/devices/0000:00:02.0"; echo 7 >"$d/sriov_totalvfs"; echo "${1:-0}" >"$d/sriov_numvfs"; }
+
+T="vgpu-explicit-vf"; setup
+vfhost; mkvm 101 ovmf q35 vmware
+tool --mode vgpu --vmid 101 --vf 5 --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_eq "$(key 101 hostpci0)" "0000:00:02.5,pcie=1"
+mkvm 102 ovmf q35 vmware
+tool --mode vgpu --vmid 102 --vf 9 --yes; assert_eq "$?" 1 "VF beyond count"
+teardown
+
+T="vgpu-vf-count-change-in-use"; setup
+vfhost 7; mkvm 101 ovmf q35 vmware
+tool --mode vgpu --vmid 101 --yes
+tool --mode vgpu --vfs 3 --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "assigned to a VM"
+assert_eq "$(cat "$R/sys/bus/pci/devices/0000:00:02.0/sriov_numvfs")" 7
+teardown
+
+T="vgpu-rollback-restores-vf-count"; setup
+vfhost 0; mkvm 101 ovmf q35 vmware
+QM_FAIL_KEY=hostpci0 tool --mode vgpu --vmid 101 --yes; assert_eq "$?" 1
+assert_eq "$(cat "$R/sys/bus/pci/devices/0000:00:02.0/sriov_numvfs")" 0 "VF count rolled back"
+assert_nofile "$R/etc/systemd/system/pve-intel-gpu-vfs.service"
+teardown
+
+T="vgpu-dkms-not-built"; setup
+printf '#!/bin/sh\necho "i915-sriov-dkms/2025.1: added"\n' >"$B/dkms"; chmod +x "$B/dkms"
+tool --mode vgpu --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_contains "$(cat "$W/err")" "not built"
+assert_contains "$(tool --mode check)" "i915-sriov-dkms: not-built"
+teardown
+
+T="vgpu-xe-driver"; setup
+vfhost 0; d="$R/sys/bus/pci/devices/0000:00:02.0"; mkdir -p "$R/sys/bus/pci/drivers/xe"
+rm "$d/driver"; ln -s ../../drivers/xe "$d/driver"; echo 0x7d55 >"$d/device"
+mkvm 101 ovmf q35 vmware
+tool --mode vgpu --vmid 101 --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_eq "$(key 101 hostpci0)" "0000:00:02.1,pcie=1"
+assert_not "$(cat "$R/etc/default/grub")" "module_blacklist=xe" "no i915 params when xe already offers VFs"
+teardown
+
+T="no-sriov-generation"; setup
+echo 0x3e92 >"$R/sys/bus/pci/devices/0000:00:02.0/device"   # Coffee Lake
+tool --mode vgpu --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "has no SR-IOV"
+teardown
+
+# ---------------------------------------------------------------- misc paths
+T="hostpci-mapping-and-multi"; setup
+{ echo "bios: ovmf"; echo "hostpci0: 0000:00:1f.3;00:02.0,romfile=x.rom"; echo "hostpci1: mapping=gpu0"; } >"$W/vms/100.conf"
+out="$(tool --mode check)"
+assert_contains "$out" "VM 100: full passthrough (hostpci0"
+assert_not "$out" "hostpci1" "mapping= entries are not ours"
+teardown
+
+T="audio-missing-device"; setup
+rm -rf "$R/sys/bus/pci/devices/0000:00:1f.3"; mkvm 100 ovmf q35 vmware; mkrom r.rom
+tool --mode passthrough --vmid 100 --rom "$W/r.rom" --audio --yes; assert_eq "$?" 0
+assert_contains "$(cat "$W/err")" "No audio device"
+assert_eq "$(key 100 hostpci1)" ""
+teardown
+
+T="running-vm-warning"; setup
+mkvm 100 ovmf q35 vmware; mkrom r.rom; : >"$W/vms/100.running"
+tool --mode passthrough --vmid 100 --rom "$W/r.rom" --yes; assert_eq "$?" 0
+assert_contains "$(cat "$W/err")" "full stop/start"
+teardown
+
+T="reapply-errors"; setup
+mkvm 100 ovmf q35 vmware
+tool --mode reapply --vmid 100; assert_eq "$?" 1 "no state"
+mkrom r.rom; tool --mode passthrough --vmid 100 --rom "$W/r.rom" --yes
+"$B/qm" set 100 --hostpci0 0000:01:00.0
+tool --mode reapply --vmid 100; assert_eq "$?" 1 "hostpci changed by someone else"
+assert_contains "$(cat "$W/err")" "no longer points"
+teardown
+
+T="log-levels"; setup
+LOG_LEVEL=none tool --mode prepare --yes
+assert_nofile "$W/tool.log"
+assert_eq "$(cat "$W/err")" "" "none: quiet console"
+LOG_LEVEL=none tool --mode revert --vmid 999 --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "[ERROR]" "errors always shown"
+LOG_LEVEL=debug tool --mode check >/dev/null
+assert_contains "$(cat "$W/tool.log")" "[DEBUG]"
+tool --mode check --log loud; assert_eq "$?" 2
 teardown
 
 echo "passed: $PASS, failed: $FAIL"
