@@ -2,8 +2,10 @@
 
 Единый инструмент для Intel iGPU на Proxmox VE:
 
-- Включение и настройка **vGPU / SR-IOV**
-- **Полный passthrough** с автовыбором ROM под поколение (6–14 / Ultra)
+- **vGPU с автовыбором технологии по поколению iGPU**: GVT-g на Gen8–9
+  (Broadwell … Comet Lake), SR-IOV на Gen12+ (Tiger Lake … Core Ultra)
+- Профили гостей, в том числе **BlissOS / Android-x86** (`--guest android`)
+- **Полный passthrough** с автовыбором ROM под поколение (6–14 / Ultra) — запасной вариант
 - Детекция версий PVE / QEMU / ядра и поколения CPU
 - Безопасный откат и гибкое логирование
 
@@ -12,21 +14,47 @@
 Включение функции и использование её как дисплея — звенья одной цепи.  
 Отдельные репозитории создавали лишнюю путаницу.
 
+## Установка
+
+```bash
+curl -fsSLO https://github.com/DrLingvo/pve-intel-gpu/releases/latest/download/install.sh
+bash install.sh --yes          # или --release v0.3.0
+pve-intel-gpu --mode status
+```
+
+`install.sh` сверяет все файлы релиза с `SHA256SUMS`, ставит их в `/opt/pve-intel-gpu`
+(команда `/usr/local/sbin/pve-intel-gpu`), берёт общий lock host-tools и показывает,
+совпадает ли версия контракта с realpc. Пакеты, ядро и ВМ он не трогает. Обновление:
+`install.sh --mode update`, удаление: `install.sh --mode uninstall` (откажет, пока
+изменения хоста не откачены через `pve-intel-gpu --mode revert`). Из локальной копии
+репозитория: `install.sh --from . --yes`.
+
 ## Быстрый старт
 
 ```bash
-# подробный лог
-LOG_LEVEL=debug ./pve-intel-gpu.sh --mode status
-
-# подготовка хоста
-./pve-intel-gpu.sh --mode prepare
-
-# vGPU
-./pve-intel-gpu.sh --mode vgpu
-
-# полный passthrough конкретной ВМ
-./pve-intel-gpu.sh --mode passthrough --vmid 100
+pve-intel-gpu --mode status                          # поколение, технология vGPU, realpc
+pve-intel-gpu --mode vgpu --yes                      # хост: GVT-g или SR-IOV, затем перезагрузка
+pve-intel-gpu --mode vgpu --vmid 101 --guest android # ВМ BlissOS получает vGPU
+pve-intel-gpu --mode passthrough --vmid 100          # запасной вариант: вся iGPU одной ВМ
 ```
+
+## vGPU: какая технология где
+
+| iGPU | Технология | Что получает ВМ |
+| --- | --- | --- |
+| Broadwell, Skylake, Kaby/Coffee/Comet Lake, Apollo Lake (Gen8–9) | GVT-g (`i915.enable_gvt=1`, `kvmgt`) | mdev `i915-GVTg_V5_*`; тип выбирается по свободным слотам или `--gvt-type` |
+| Tiger/Rocket/Alder/Raptor Lake, Core Ultra (Gen12+) | SR-IOV (VF, при необходимости i915-sriov-dkms) | отдельная VF `00:02.N` |
+| Haswell, Ice/Jasper/Elkhart Lake, Gemini Lake | нет | только `--mode passthrough` |
+
+### BlissOS / Android-x86 (`--guest android`)
+
+- GVT-g: экраном ВМ становится сам vGPU (`display=on`, `ramfb`, `egl-headless`,
+  `vga: none`), консоль Proxmox (noVNC) показывает его вывод. `--display console`
+  оставляет обычный `vga` ВМ.
+- В загрузке BlissOS: без `nomodeset`; аппаратное видео — `FFMPEG_CODEC2_PREFER=1`,
+  без `FFMPEG_HWACCEL_DISABLE`.
+- SR-IOV: ядру гостя нужен драйвер VF i915 (i915-sriov-dkms в госте); у VF нет
+  вывода изображения — экран через `vga` ВМ или scrcpy.
 
 Лог-файл называется так же, как скрипт (без `.sh`).
 
@@ -87,6 +115,12 @@ pve-intel-gpu и [realpc-clean-build](https://github.com/DrLingvo/realpc-clean-b
 - скрипт не трогает `kvm.ko`, `pve-qemu-kvm`, `pve-edk2-firmware` и APT hold;
 - `--mode check` показывает состояние realpc и предупреждает, если контракт не совпадает
   или после `configvm` нужен `--mode reapply`.
+
+Известная граница контракта: откат realpc чистит из старой строки `args` только токены
+`-set device.hostpciN.{addr,bus,x-igd-*}`. Если до `configvm` у ВМ уже был GVT-g-экран,
+после отката `-display egl-headless` может оказаться в `args` дважды; `--mode check`
+это показывает, `--mode reapply --vmid N` исправляет. Правильное решение — расширить
+очистку в realpc на `display`/`ramfb`/`driver` и `-display egl-headless,…00:02.0…`.
 
 Порядок: сначала `realpc-setup.sh` (`strong`, `configvm`), затем этот скрипт. Полный
 откат — в обратном порядке. **Любая правка формата `args`, отката, state или блокировки

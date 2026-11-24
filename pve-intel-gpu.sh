@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # pve-intel-gpu.sh
 # Unified tool for Intel iGPU on Proxmox VE:
-#   - vGPU / SR-IOV: enable virtual functions on the host and assign one per VM
+#   - vGPU, technology chosen by the iGPU generation:
+#       Gen8-9 (Broadwell .. Comet Lake): GVT-g mediated devices (mdev)
+#       Gen12+ (Tiger Lake .. Core Ultra): SR-IOV virtual functions
+#   - guest profiles (--guest android for BlissOS, linux, windows)
 #   - full passthrough with generation-aware ROM (6-14 gen / Core Ultra 1-2)
 # Detects PVE / QEMU / kernel and the iGPU generation by PCI device ID.
 #
@@ -18,9 +21,10 @@
 
 set -Eeuo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_NAME="$(basename "$0")"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# resolve the symlink installed by install.sh (/usr/local/sbin/pve-intel-gpu)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
 # ROOT is empty on a real host; the test suite points it to a fake tree.
 ROOT="${PIG_ROOT:-}"
@@ -51,6 +55,7 @@ AUDIO_BDF="0000:00:1f.3"
 # ---------------------------------------------------------------- options
 MODE="check"; VMID=""; VF=""; NUMVFS=""; ROM=""; GMS="0x2"; AUDIO=0
 ROM_IDS=""; ROM_QEMU="10"; ROM_SOURCE=""
+GUEST=""; DISPLAY_MODE=""; GVT_TYPE=""
 DKMS_DEB=""; YES=0; DRY_RUN=0; FORCE=0
 LOG_LEVEL="${LOG_LEVEL:-normal}"
 LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/${SCRIPT_NAME%.sh}.log}"
@@ -64,8 +69,9 @@ Usage: $SCRIPT_NAME --mode MODE [options]
 Modes:
   check | status   Read-only report: host, iGPU, IOMMU, VFs, VMs, realpc state
   prepare          Enable IOMMU (intel_iommu=on iommu=pt) and load vfio modules
-  vgpu             Host: enable SR-IOV VFs and keep them across reboots
-                   With --vmid: also give the VM a free VF
+  vgpu             vGPU by iGPU generation: GVT-g (Gen8-9) or SR-IOV (Gen12+)
+                   Host: GVT-g (i915.enable_gvt, kvmgt) or SR-IOV VFs kept across reboots
+                   With --vmid: give the VM a GVT-g mdev or a free VF
   passthrough      Host: bind the iGPU to vfio-pci
                    With --vmid: hostpci + ROM + IGD args + vga none for the VM
   reapply          With --vmid: put our IGD args/vga back (e.g. after realpc configvm)
@@ -76,6 +82,12 @@ Modes:
 
 Options:
   --vmid N         VM ID
+  --guest G        android (BlissOS) | linux | windows: display and driver defaults, hints
+  --display D      vgpu: the VM screen is the vGPU itself (GVT-g display=on, noVNC)
+                   console: keep the VM's own vga, vGPU only renders/decodes
+                   default: vgpu for android/linux with GVT-g, console otherwise
+  --gvt-type T     GVT-g type, e.g. i915-GVTg_V5_4 (default: first with a free slot,
+                   order V5_4, V5_2, V5_8, V5_1)
   --vf N           VF number to assign (1..7); default: first free VF
   --vfs N          Number of VFs to create (default: 7, capped by sriov_totalvfs)
   --rom FILE|NAME  ROM file (unverified, your choice) or a catalog/kvm name;
@@ -93,7 +105,7 @@ Options:
 Examples:
   LOG_LEVEL=debug $SCRIPT_NAME --mode status
   $SCRIPT_NAME --mode prepare
-  $SCRIPT_NAME --mode vgpu --vmid 101
+  $SCRIPT_NAME --mode vgpu --vmid 101 --guest android
   $SCRIPT_NAME --mode passthrough --vmid 100 --dry-run
 EOF
 }
@@ -112,6 +124,9 @@ parse_args() {
             --audio)    AUDIO=1; shift ;;
             --dkms-deb) DKMS_DEB="$(val --dkms-deb "${2-}")"; shift 2 ;;
             --ids)      ROM_IDS="$(val --ids "${2-}")"; shift 2 ;;
+            --guest)    GUEST="$(val --guest "${2-}")"; shift 2 ;;
+            --display)  DISPLAY_MODE="$(val --display "${2-}")"; shift 2 ;;
+            --gvt-type) GVT_TYPE="$(val --gvt-type "${2-}")"; shift 2 ;;
             --qemu)     ROM_QEMU="$(val --qemu "${2-}")"; shift 2 ;;
             --source)   ROM_SOURCE="$(val --source "${2-}")"; shift 2 ;;
             --yes|-y)   YES=1; shift ;;
@@ -133,6 +148,9 @@ parse_args() {
     [[ -z "$VF" || "$VF" =~ ^[1-9][0-9]*$ ]] || { echo "--vf must be a positive number" >&2; exit 2; }
     [[ -z "$NUMVFS" || "$NUMVFS" =~ ^[1-9][0-9]*$ ]] || { echo "--vfs must be a positive number" >&2; exit 2; }
     [[ "$GMS" =~ ^0x[0-9a-fA-F]+$ ]] || { echo "--gms must be hex, e.g. 0x2" >&2; exit 2; }
+    case "$GUEST" in ""|android|linux|windows) ;; *) echo "--guest must be android, linux or windows" >&2; exit 2 ;; esac
+    case "$DISPLAY_MODE" in ""|vgpu|console) ;; *) echo "--display must be vgpu or console" >&2; exit 2 ;; esac
+    [[ -z "$GVT_TYPE" || "$GVT_TYPE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--gvt-type: e.g. i915-GVTg_V5_4" >&2; exit 2; }
     if [[ "$MODE" == reapply && -z "$VMID" ]]; then echo "reapply needs --vmid" >&2; exit 2; fi
     if [[ "$MODE" == rom-add ]]; then
         [[ -n "$ROM" && -n "$ROM_IDS" ]] || { echo "rom-add needs --rom FILE and --ids \"46d1 46d0\"" >&2; exit 2; }
@@ -345,7 +363,7 @@ detect_versions() {
 
 # Fills IGPU_* from sysfs. Generation by PCI device ID (prefix table).
 IGPU_PRESENT=0; IGPU_DID=""; IGPU_NAME="not found"; IGPU_GENS=""
-IGPU_XE=0; IGPU_DRIVER=none; IGPU_TOTALVFS=0; IGPU_NUMVFS=0
+IGPU_TECH=none; IGPU_DRIVER=none; IGPU_TOTALVFS=0; IGPU_NUMVFS=0
 detect_igpu() {
     local dev="$SYS_PCI/$IGPU_BDF" vendor class
     vendor="$(readf "$dev/vendor")"; class="$(readf "$dev/class")"
@@ -361,27 +379,29 @@ detect_igpu() {
     case "$IGPU_DID" in
         0f3?)            IGPU_NAME="Bay Trail (Atom)"; IGPU_GENS="" ;;
         04??|0a??|0d??)  IGPU_NAME="Haswell (4th gen)"; IGPU_GENS="4" ;;
-        16??|22b?)       IGPU_NAME="Broadwell/Braswell (5th gen)"; IGPU_GENS="5" ;;
-        19??)            IGPU_NAME="Skylake (6th gen)"; IGPU_GENS="6" ;;
-        5a8?)            IGPU_NAME="Apollo Lake (Atom/Celeron)"; IGPU_GENS="" ;;
-        59??|87c0)       IGPU_NAME="Kaby/Amber Lake (7th-8th gen)"; IGPU_GENS="7 8" ;;
+        16??|22b?)       IGPU_NAME="Broadwell/Braswell (5th gen)"; IGPU_GENS="5"; IGPU_TECH=gvt ;;
+        19??)            IGPU_NAME="Skylake (6th gen)"; IGPU_GENS="6"; IGPU_TECH=gvt ;;
+        5a8?)            IGPU_NAME="Apollo Lake (Atom/Celeron)"; IGPU_GENS=""; IGPU_TECH=gvt ;;
+        59??|87c0)       IGPU_NAME="Kaby/Amber Lake (7th-8th gen)"; IGPU_GENS="7 8"; IGPU_TECH=gvt ;;
         318?)            IGPU_NAME="Gemini Lake (Celeron/Pentium)"; IGPU_GENS="" ;;
-        3e??|87ca)       IGPU_NAME="Coffee Lake (8th-9th gen)"; IGPU_GENS="8 9" ;;
-        9b??)            IGPU_NAME="Comet Lake (10th gen)"; IGPU_GENS="10" ;;
+        3e??|87ca)       IGPU_NAME="Coffee Lake (8th-9th gen)"; IGPU_GENS="8 9"; IGPU_TECH=gvt ;;
+        9b??)            IGPU_NAME="Comet Lake (10th gen)"; IGPU_GENS="10"; IGPU_TECH=gvt ;;
         8a??)            IGPU_NAME="Ice Lake (10th gen)"; IGPU_GENS="10" ;;
         4e??)            IGPU_NAME="Jasper Lake (Celeron/Pentium)"; IGPU_GENS="" ;;
         45??)            IGPU_NAME="Elkhart Lake (Atom/Celeron)"; IGPU_GENS="" ;;
-        9a??)            IGPU_NAME="Tiger Lake (11th gen)"; IGPU_GENS="11"; IGPU_XE=1 ;;
-        4c??)            IGPU_NAME="Rocket Lake (11th gen)"; IGPU_GENS="11"; IGPU_XE=1 ;;
-        46d?)            IGPU_NAME="Alder Lake-N (N-series)"; IGPU_GENS="";   IGPU_XE=1 ;;
-        46??)            IGPU_NAME="Alder Lake (12th gen)"; IGPU_GENS="12"; IGPU_XE=1 ;;
-        a7??)            IGPU_NAME="Raptor Lake (13th-14th gen)"; IGPU_GENS="13 14"; IGPU_XE=1 ;;
-        7d??)            IGPU_NAME="Meteor/Arrow Lake (Core Ultra 1-2)"; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
-        64??)            IGPU_NAME="Lunar Lake (Core Ultra 200V)"; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
-        b0??)            IGPU_NAME="Panther Lake (Core Ultra 3)"; IGPU_GENS="Ultra"; IGPU_XE=1 ;;
+        9a??)            IGPU_NAME="Tiger Lake (11th gen)"; IGPU_GENS="11"; IGPU_TECH=sriov ;;
+        4c??)            IGPU_NAME="Rocket Lake (11th gen)"; IGPU_GENS="11"; IGPU_TECH=sriov ;;
+        46d?)            IGPU_NAME="Alder Lake-N (N-series)"; IGPU_GENS="";   IGPU_TECH=sriov ;;
+        46??)            IGPU_NAME="Alder Lake (12th gen)"; IGPU_GENS="12"; IGPU_TECH=sriov ;;
+        a7??)            IGPU_NAME="Raptor Lake (13th-14th gen)"; IGPU_GENS="13 14"; IGPU_TECH=sriov ;;
+        7d??)            IGPU_NAME="Meteor/Arrow Lake (Core Ultra 1-2)"; IGPU_GENS="Ultra"; IGPU_TECH=sriov ;;
+        64??)            IGPU_NAME="Lunar Lake (Core Ultra 200V)"; IGPU_GENS="Ultra"; IGPU_TECH=sriov ;;
+        b0??)            IGPU_NAME="Panther Lake (Core Ultra 3)"; IGPU_GENS="Ultra"; IGPU_TECH=sriov ;;
         *)               IGPU_NAME="unknown Intel GPU"; IGPU_GENS="" ;;
     esac
-    log_debug "iGPU $IGPU_BDF 8086:$IGPU_DID $IGPU_NAME driver=$IGPU_DRIVER vfs=$IGPU_NUMVFS/$IGPU_TOTALVFS"
+    # Braswell (22b?) has no GVT-g support in i915
+    [[ "$IGPU_DID" == 22b? ]] && IGPU_TECH=none
+    log_debug "iGPU $IGPU_BDF 8086:$IGPU_DID $IGPU_NAME tech=$IGPU_TECH driver=$IGPU_DRIVER vfs=$IGPU_NUMVFS/$IGPU_TOTALVFS"
 }
 
 # catalog_lookup DID -> "rom<TAB>min_qemu" of the longest matching ID prefix
@@ -592,7 +612,8 @@ igd_tokens() {
 # remove our tokens for index N from an args string, keep everything else as is
 strip_igd_tokens() {
     local args=$1 n=$2
-    args="$(sed -E "s/(^| )-set device\.hostpci$n\.(addr|bus|x-igd-[a-z-]+)=[^ ]+//g" <<<"$args")"
+    args="$(sed -E -e "s/(^| )-set device\.hostpci$n\.(addr|bus|x-igd-[a-z-]+|display|ramfb|driver)=[^ ]+//g" \
+        -e "s/(^| )-display egl-headless,rendernode=[^ ]*pci-$IGPU_BDF-render//g" <<<"$args")"
     args="${args#"${args%%[! ]*}"}"; args="${args%"${args##*[! ]}"}"
     printf '%s' "$args"
 }
@@ -602,9 +623,9 @@ vm_st_get() { readf "$(vm_state_dir "$1")/$2"; }
 vm_st_put() { [[ "$DRY_RUN" == 1 ]] && return 0; file_put "$(vm_state_dir "$1")/$2" <<<"$3"; }
 
 # ---------------------------------------------------------------- host steps
-host_prepare() {
+host_prepare() {   # [extra modules...]
     params_add intel_iommu=on iommu=pt
-    file_put "$MODULES_FILE" < <(printf '%s\n' "# Managed by pve-intel-gpu.sh - removed by --mode revert" vfio vfio_iommu_type1 vfio_pci)
+    file_put "$MODULES_FILE" < <(printf '%s\n' "# Managed by pve-intel-gpu.sh - removed by --mode revert" vfio vfio_iommu_type1 vfio_pci "$@")
     [[ "$FILE_CHANGED" == 1 ]] && NEED_INITRAMFS=1
     [[ -n "$(st_get HOST_MODE)" ]] || st_set HOST_MODE prepared
     return 0
@@ -659,16 +680,116 @@ set_numvfs() {
     log_ok "SR-IOV: $n VFs enabled"
 }
 
+# ---------------------------------------------------------------- vGPU: technology by generation
+# VMs whose hostpci points to the whole iGPU: with mdev= (GVT-g) or without (passthrough)
+igpu_vms() {   # gvt|passthrough [skip-vmid]
+    local kind=$1 skip=${2:-} id idx val
+    for id in $(vm_list); do
+        [[ "$id" == "$skip" ]] && continue
+        VM_CACHE_ID=""
+        while IFS=$'\t' read -r idx val; do
+            [[ -z "$idx" ]] && continue
+            hostpci_bdfs "$val" | grep -qx "$IGPU_BDF" || continue
+            if [[ "$val" == *mdev=* ]]; then [[ "$kind" == gvt ]] && echo "$id"
+            else [[ "$kind" == passthrough ]] && echo "$id"; fi
+            break
+        done < <(vm_hostpcis "$id")
+    done
+    VM_CACHE_ID=""
+}
+
 host_vgpu() {
     [[ "$IGPU_PRESENT" == 1 ]] || die "No Intel iGPU at $IGPU_BDF"
-    local hm; hm="$(st_get HOST_MODE)"
+    case "$IGPU_TECH" in
+        gvt|sriov) ;;
+        *) die "$IGPU_NAME (8086:$IGPU_DID) has neither GVT-g (Gen8-9) nor SR-IOV (Gen12+). Only --mode passthrough is possible." ;;
+    esac
+    local hm users; hm="$(st_get HOST_MODE)"
     if [[ "$hm" == passthrough ]]; then
-        [[ -z "$(vms_using "$IGPU_BDF")" ]] || die "The iGPU is passed through to VM(s) $(vms_using "$IGPU_BDF" | xargs). Revert them first."
+        users="$(igpu_vms passthrough | xargs)"
+        [[ -z "$users" ]] || die "The iGPU is passed through to VM(s) $users. Revert them first."
         log_info "Switching host mode passthrough -> vgpu"
         file_del "$MODPROBE_FILE"; [[ "$FILE_CHANGED" == 1 ]] && NEED_INITRAMFS=1
     fi
+    if [[ "$IGPU_TECH" == gvt ]]; then host_gvt; else host_sriov; fi
+}
+
+GVT_TYPES_DIR=""
+gvt_active() {
+    GVT_TYPES_DIR="$SYS_PCI/$IGPU_BDF/mdev_supported_types"
+    compgen -G "$GVT_TYPES_DIR/i915-GVTg_*" >/dev/null
+}
+kvmgt_available() { modinfo -n kvmgt >/dev/null 2>&1; }
+
+host_gvt() {
+    kvmgt_available || die "Kernel $KERNEL has no kvmgt module (CONFIG_DRM_I915_GVT_KVMGT); GVT-g is not possible with this kernel."
+    host_prepare kvmgt
+    st_set HOST_MODE vgpu
+    st_set VGPU_TECH gvt
+    # GVT-g needs i915 on the host with GuC submission off
+    params_add i915.enable_gvt=1 i915.enable_guc=0
+    if [[ "$IGPU_DRIVER" != i915 ]]; then
+        log_warn "The iGPU is bound to '$IGPU_DRIVER'; GVT-g needs i915 on the host (reboot after this change)"
+    fi
+    if gvt_active; then
+        log_ok "GVT-g active: $(gvt_type_list | tr '\n' ' ')"
+    else
+        NEED_INITRAMFS=1
+        log_warn "GVT-g will be available after a reboot. Then rerun: $SCRIPT_NAME --mode vgpu${VMID:+ --vmid $VMID}${GUEST:+ --guest $GUEST}"
+        VGPU_PENDING_REBOOT=1
+    fi
+}
+
+# "type avail capacity resolution" per type, capacity = free + already created
+gvt_type_list() {
+    local d t avail created res
+    gvt_active || return 0
+    for d in "$GVT_TYPES_DIR"/i915-GVTg_*; do
+        t="$(basename "$d")"
+        avail="$(readf "$d/available_instances")"; [[ "$avail" =~ ^[0-9]+$ ]] || avail=0
+        created="$(find "$d/devices" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')"
+        res="$(sed -n 's/^resolution: *//p' "$d/description" 2>/dev/null | head -n1)"
+        echo "$t $avail $((avail + created)) ${res:-?}"
+    done
+}
+
+# VMs configured with GVT-g type T (other than skip)
+gvt_configured() {
+    local t=$1 skip=${2:-} id n=0
+    for id in $(igpu_vms gvt "$skip"); do
+        VM_CACHE_ID=""
+        vm_config "$id" | grep -qE "^hostpci[0-9]+: .*mdev=$t(,|$)" && n=$((n + 1))
+    done
+    VM_CACHE_ID=""
+    echo "$n"
+}
+
+gvt_pick_type() {   # sets GVT_PICKED
+    local vmid=$1 t cap line want
+    GVT_PICKED=""
+    gvt_active || die "GVT-g is not active (no mdev types on $IGPU_BDF). Reboot after --mode vgpu, check 'dmesg | grep -i gvt'."
+    if [[ -n "$GVT_TYPE" ]]; then
+        line="$(gvt_type_list | awk -v t="$GVT_TYPE" '$1 == t')"
+        [[ -n "$line" ]] || die "GVT-g type $GVT_TYPE does not exist. Available: $(gvt_type_list | awk '{print $1}' | xargs)"
+        cap="$(awk '{print $3}' <<<"$line")"
+        [[ "$(gvt_configured "$GVT_TYPE" "$vmid")" -lt "$cap" ]] \
+            || log_warn "All $cap $GVT_TYPE slots are configured in other VMs: they cannot all run at once"
+        GVT_PICKED="$GVT_TYPE"; return 0
+    fi
+    for want in V5_4 V5_2 V5_8 V5_1; do
+        t="i915-GVTg_$want"
+        line="$(gvt_type_list | awk -v t="$t" '$1 == t')"
+        [[ -n "$line" ]] || continue
+        cap="$(awk '{print $3}' <<<"$line")"
+        if [[ "$(gvt_configured "$t" "$vmid")" -lt "$cap" ]]; then GVT_PICKED="$t"; return 0; fi
+    done
+    die "No free GVT-g slot: every type is fully configured in other VMs. Free one (--mode revert --vmid N) or pass --gvt-type."
+}
+
+host_sriov() {
     host_prepare
     st_set HOST_MODE vgpu
+    st_set VGPU_TECH sriov
     if [[ "$IGPU_TOTALVFS" -gt 0 && ( "$IGPU_DRIVER" == i915 || "$IGPU_DRIVER" == xe ) ]]; then
         local n="${NUMVFS:-7}"; [[ "$n" -gt "$IGPU_TOTALVFS" ]] && n="$IGPU_TOTALVFS"
         set_numvfs "$n"
@@ -677,7 +798,6 @@ host_vgpu() {
         return 0
     fi
     # SR-IOV not available yet: driver/kernel side
-    [[ "$IGPU_XE" == 1 ]] || die "$IGPU_NAME has no SR-IOV (Gen12/Xe or newer is required). Use --mode passthrough."
     secure_boot_on && log_warn "Secure Boot is enabled: an unsigned DKMS module will not load (enrol a MOK or disable Secure Boot)"
     local dk; dk="$(dkms_sriov_state)"
     if [[ "$dk" == absent ]]; then
@@ -693,7 +813,7 @@ host_vgpu() {
     st_set NUMVFS "$n"
     write_vf_unit "$n"
     NEED_INITRAMFS=1
-    log_warn "SR-IOV will be available after a reboot. Then rerun: $SCRIPT_NAME --mode vgpu${VMID:+ --vmid $VMID}"
+    log_warn "SR-IOV will be available after a reboot. Then rerun: $SCRIPT_NAME --mode vgpu${VMID:+ --vmid $VMID}${GUEST:+ --guest $GUEST}"
     VGPU_PENDING_REBOOT=1
 }
 VGPU_PENDING_REBOOT=0
@@ -704,13 +824,16 @@ host_passthrough() {
     if [[ "$hm" == vgpu ]]; then
         used="$(any_vf_assigned)"
         [[ -z "$used" ]] || die "VF $used is still assigned to a VM. Revert vGPU VMs first."
+        used="$(igpu_vms gvt | xargs)"
+        [[ -z "$used" ]] || die "GVT-g is configured in VM(s) $used. Revert vGPU VMs first."
         log_info "Switching host mode vgpu -> passthrough"
         if [[ "$IGPU_NUMVFS" != 0 ]]; then set_numvfs 0 || true; fi
         if [[ -e "$VF_UNIT" ]]; then
             if have systemctl; then run systemctl disable "$VF_UNIT_NAME" >/dev/null 2>&1 || true; fi
             file_del "$VF_UNIT"; UNIT_TOUCHED=1
         fi
-        params_remove i915.enable_guc=3 "i915.max_vfs=$(st_get NUMVFS)" module_blacklist=xe
+        params_remove i915.enable_guc=3 "i915.max_vfs=$(st_get NUMVFS)" module_blacklist=xe i915.enable_gvt=1 i915.enable_guc=0
+        st_del VGPU_TECH
     fi
     host_prepare
     file_put "$MODPROBE_FILE" <<EOF
@@ -822,6 +945,11 @@ vm_passthrough_precheck() {
     for i in $(seq 1 7); do
         [[ -z "$(vm_hostpci_for "$vmid" "${IGPU_BDF%.*}.$i")" ]] || die "VM $vmid has a vGPU VF. Revert it first (--mode revert --vmid $vmid)."
     done
+    local gi; gi="$(vm_hostpci_for "$vmid" "$IGPU_BDF")"
+    if [[ -n "$gi" && "$(vm_get "$vmid" "hostpci$gi")" == *mdev=* ]]; then
+        die "VM $vmid has a GVT-g vGPU. Revert it first (--mode revert --vmid $vmid)."
+    fi
+    [[ -z "$(igpu_vms gvt | xargs)" ]] || die "GVT-g is configured in VM(s) $(igpu_vms gvt | xargs); full passthrough would take the iGPU away from them."
     resolve_rom
     if [[ "$QEMU_MAJOR" -lt "$ROM_MINQEMU" && "$FORCE" != 1 ]]; then
         die "QEMU $QEMU_VERSION: ROM $ROM_NAME needs QEMU >= $ROM_MINQEMU. Use --force to try anyway."
@@ -875,19 +1003,91 @@ vm_passthrough() {
 vm_reapply() {
     local vmid=$1 idx frag args
     idx="$(vm_st_get "$vmid" hostpci)"; frag="$(vm_st_get "$vmid" args)"
-    [[ -n "$idx" && -n "$frag" ]] || die "VM $vmid has no passthrough state from this tool"
+    [[ -n "$idx" && -n "$frag" ]] || die "VM $vmid has no passthrough/GVT-g args state from this tool"
     [[ "$(vm_get "$vmid" "hostpci$idx")" == "$IGPU_BDF"* ]] || die "hostpci$idx of VM $vmid no longer points to $IGPU_BDF; run --mode passthrough --vmid $vmid"
     args="$(strip_igd_tokens "$(vm_get "$vmid" args)" "$idx")"
     vm_set "$vmid" args "${args:+$args }$frag"
-    vm_set "$vmid" vga none
+    [[ -n "$(vm_st_get "$vmid" vga)" ]] && vm_set "$vmid" vga none
     [[ "$DRY_RUN" == 1 ]] || file_put "$ARGS_D/$vmid/$ARGS_FRAGMENT_NAME" <<<"$frag"
-    log_ok "VM $vmid: IGD args and vga reapplied"
+    log_ok "VM $vmid: our args (and vga) reapplied"
 }
 
 vm_vgpu() {
-    local vmid=$1 n i bdf idx free="" q35=0
+    local vmid=$1
     vm_config "$vmid" >/dev/null
-    [[ -z "$(vm_hostpci_for "$vmid" "$IGPU_BDF")" ]] || die "VM $vmid has the whole iGPU passed through. Revert it first."
+    if [[ "$IGPU_TECH" == gvt ]]; then vm_gvt "$vmid"; else vm_sriov "$vmid"; fi
+    vm_st_put "$vmid" tech "$IGPU_TECH"
+    [[ -z "$GUEST" ]] || vm_st_put "$vmid" guest "$GUEST"
+    guest_hints
+}
+
+# display default: the vGPU is the screen for android/linux with GVT-g
+display_mode() {
+    if [[ -n "$DISPLAY_MODE" ]]; then echo "$DISPLAY_MODE"
+    elif [[ "$IGPU_TECH" == gvt && ( "$GUEST" == android || "$GUEST" == linux ) ]]; then echo vgpu
+    else echo console; fi
+}
+
+gvt_tokens() {   # N display
+    local n=$1 t
+    t="-set device.hostpci$n.x-igd-opregion=on"
+    if [[ "$2" == vgpu ]]; then
+        t="$t -set device.hostpci$n.display=on -set device.hostpci$n.ramfb=on -set device.hostpci$n.driver=vfio-pci-nohotplug"
+        t="$t -display egl-headless,rendernode=/dev/dri/by-path/pci-$IGPU_BDF-render"
+    fi
+    printf '%s' "$t"
+}
+
+vm_gvt() {
+    local vmid=$1 idx val i disp frag args
+    idx="$(vm_hostpci_for "$vmid" "$IGPU_BDF")"
+    if [[ -n "$idx" ]]; then
+        val="$(vm_get "$vmid" "hostpci$idx")"
+        [[ "$val" == *mdev=* ]] || die "VM $vmid has the whole iGPU passed through (hostpci$idx). Revert it first."
+    fi
+    for i in $(seq 1 7); do
+        [[ -z "$(vm_hostpci_for "$vmid" "${IGPU_BDF%.*}.$i")" ]] || die "VM $vmid has an SR-IOV VF. Revert it first."
+    done
+    gvt_pick_type "$vmid"
+    [[ -n "$idx" ]] || idx="$(vm_free_hostpci "$vmid")"
+    vm_set "$vmid" "hostpci$idx" "$IGPU_BDF,mdev=$GVT_PICKED"
+    vm_st_put "$vmid" hostpci "$idx"
+    disp="$(display_mode)"
+    if [[ "$disp" == vgpu ]]; then
+        if [[ -z "$(vm_st_get "$vmid" vga)" ]]; then
+            local oldvga; oldvga="$(vm_get "$vmid" vga)"
+            vm_st_put "$vmid" vga "${oldvga:-__ABSENT__}"
+        fi
+        vm_set "$vmid" vga none
+        [[ "$(vm_get "$vmid" bios)" == ovmf ]] || log_warn "VM $vmid uses SeaBIOS: the ramfb boot screen needs OVMF; the guest i915 screen appears once the driver loads"
+    fi
+    frag="$(gvt_tokens "$idx" "$disp")"
+    vm_st_put "$vmid" args "$frag"
+    [[ "$DRY_RUN" == 1 ]] || file_put "$ARGS_D/$vmid/$ARGS_FRAGMENT_NAME" <<<"$frag"
+    args="$(strip_igd_tokens "$(vm_get "$vmid" args)" "$idx")"
+    vm_set "$vmid" args "${args:+$args }$frag"
+    vm_running "$vmid" && log_warn "VM $vmid is running: the vGPU appears after a full stop/start"
+    log_ok "VM $vmid: GVT-g $GVT_PICKED (hostpci$idx), display: $disp"
+}
+
+guest_hints() {
+    [[ "$GUEST" == android ]] || return 0
+    log_info "BlissOS / Android-x86 guest:"
+    log_info "  - boot entry: no 'nomodeset'; keep the default drm hardware composer"
+    log_info "  - hardware video: add FFMPEG_CODEC2_PREFER=1, do not set FFMPEG_HWACCEL_DISABLE"
+    if [[ "$IGPU_TECH" == gvt ]]; then
+        log_info "  - GVT-g guest: i915 detects the vGPU itself; GuC/HuC are not used inside a vGPU"
+        [[ "$(display_mode)" == vgpu ]] && log_info "  - screen: Proxmox console (noVNC) shows the vGPU output; first boot can take a minute"
+    else
+        log_warn "  - SR-IOV: the guest kernel needs the i915 SR-IOV VF driver (i915-sriov-dkms built into the guest)."
+        log_warn "    Stock BlissOS kernels may not have it; without it Android starts without GPU acceleration."
+        log_info "  - a VF has no display output: keep the VM console vga and use scrcpy/adb for the screen"
+    fi
+}
+
+vm_sriov() {
+    local vmid=$1 n i bdf idx free="" q35=0
+    [[ -z "$(vm_hostpci_for "$vmid" "$IGPU_BDF")" ]] || die "VM $vmid has the whole iGPU passed through (or GVT-g). Revert it first."
     for i in $(seq 1 7); do
         bdf="${IGPU_BDF%.*}.$i"
         idx="$(vm_hostpci_for "$vmid" "$bdf")"
@@ -931,7 +1131,7 @@ vm_revert() {
         if [[ "$vga" == __ABSENT__ ]]; then vm_set "$vmid" vga ""; else vm_set "$vmid" vga "$vga"; fi
     fi
     local d; d="$(vm_state_dir "$vmid")"
-    local f; for f in hostpci hostpci_audio vga args; do file_del "$d/$f"; done
+    local f; for f in hostpci hostpci_audio vga args tech guest; do file_del "$d/$f"; done
     file_del "$ARGS_D/$vmid/$ARGS_FRAGMENT_NAME"
     log_ok "VM $vmid: our changes removed"
 }
@@ -961,7 +1161,7 @@ host_revert() {
         fi
         st_del "$k"
     done < <(sed -n 's/^\(ROM_OWNED_[^=]*\)=.*/\1/p' "$STATE_FILE" 2>/dev/null)
-    st_del HOST_MODE; st_del NUMVFS
+    st_del HOST_MODE; st_del NUMVFS; st_del VGPU_TECH
     log_info "Installed packages (e.g. i915-sriov-dkms) are not removed; remove them with apt if wanted"
 }
 
@@ -1013,9 +1213,20 @@ mode_check() {
                 *) _ck WARN "ROM $rn: not listed in bios/SHA256SUMS" ;;
             esac; fi
         fi
-        if [[ "$IGPU_TOTALVFS" -gt 0 ]]; then _ck OK "SR-IOV: $IGPU_NUMVFS of $IGPU_TOTALVFS VFs enabled"
-        elif [[ "$IGPU_XE" == 1 ]]; then _ck "" "SR-IOV: not available with the current driver (i915-sriov-dkms: $(dkms_sriov_state))"
-        else _ck "" "SR-IOV: not supported by this generation"; fi
+        case "$IGPU_TECH" in
+            gvt)
+                _ck OK "vGPU technology: GVT-g (Gen8-9)"
+                if kvmgt_available; then _ck OK "kvmgt module available"; else _ck WARN "kvmgt module missing in kernel $KERNEL"; fi
+                if gvt_active; then
+                    local t a c r
+                    while read -r t a c r; do _ck OK "GVT-g type $t: $a free of $c, $r, configured in $(gvt_configured "$t") VM(s)"; done < <(gvt_type_list)
+                else _ck WARN "GVT-g not active (run --mode vgpu, then reboot)"; fi ;;
+            sriov)
+                _ck OK "vGPU technology: SR-IOV (Gen12+)"
+                if [[ "$IGPU_TOTALVFS" -gt 0 ]]; then _ck OK "SR-IOV: $IGPU_NUMVFS of $IGPU_TOTALVFS VFs enabled"
+                else _ck "" "SR-IOV: not available with the current driver (i915-sriov-dkms: $(dkms_sriov_state))"; fi ;;
+            *) _ck WARN "vGPU technology: none for this generation (neither GVT-g nor SR-IOV); only passthrough" ;;
+        esac
     fi
 
     echo "realpc-clean-build"
@@ -1040,7 +1251,17 @@ mode_check() {
             for bdf in $(hostpci_bdfs "$val"); do
                 [[ "$bdf" == "${IGPU_BDF%.*}."* ]] || continue
                 any=1
-                if [[ "$bdf" == "$IGPU_BDF" ]]; then
+                if [[ "$bdf" == "$IGPU_BDF" && "$val" == *mdev=* ]]; then
+                    _ck "" "VM $id: GVT-g vGPU (hostpci$idx: $val)"
+                    if [[ -n "$(vm_st_get "$id" args)" ]] && [[ "$(vm_get "$id" args)" != *"$(vm_st_get "$id" args)"* ]]; then
+                        _ck WARN "VM $id: vGPU args are missing (args line was rewritten) -> --mode reapply --vmid $id"
+                    fi
+                    if [[ -n "$(vm_st_get "$id" vga)" && "$(vm_get "$id" vga)" != none ]]; then
+                        _ck WARN "VM $id: vga is '$(vm_get "$id" vga)', expected none for the vGPU screen -> --mode reapply --vmid $id"
+                    fi
+                    [[ "$(grep -o -- '-display egl-headless' <<<"$(vm_get "$id" args)" | wc -l | tr -d ' ')" -le 1 ]] \
+                        || _ck WARN "VM $id: -display egl-headless appears twice in args (QEMU will refuse) -> --mode reapply --vmid $id"
+                elif [[ "$bdf" == "$IGPU_BDF" ]]; then
                     _ck "" "VM $id: full passthrough (hostpci$idx: $val)"
                     [[ "$(vm_get "$id" vga)" == none ]] || _ck WARN "VM $id: vga is '$(vm_get "$id" vga)', expected none (realpc configvm resets it) -> --mode reapply --vmid $id"
                     if [[ -n "$(vm_st_get "$id" args)" ]] && [[ "$(vm_get "$id" args)" != *"$(vm_st_get "$id" args)"* ]]; then
@@ -1076,7 +1297,7 @@ main() {
     take_lock
     case "$MODE" in
         prepare)     confirm "Enable IOMMU and vfio modules on this host?" || exit 0 ;;
-        vgpu)        confirm "Configure SR-IOV vGPU${VMID:+ and give VM $VMID a VF}?" || exit 0 ;;
+        vgpu)        confirm "Configure vGPU ($IGPU_TECH) for $IGPU_NAME${VMID:+ and give VM $VMID a vGPU}?" || exit 0 ;;
         passthrough) confirm "Bind the iGPU to vfio-pci (host loses iGPU output)${VMID:+ and pass it to VM $VMID}?" || exit 0 ;;
         revert)      confirm "Remove pve-intel-gpu changes${VMID:+ from VM $VMID}${VMID:- from the host}?" || exit 0 ;;
         reapply)     : ;;

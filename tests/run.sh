@@ -34,6 +34,7 @@ setup() {
         printf '#!/bin/sh\necho "%s $*" >>"$FAKE/calls"\n' "$c" >"$B/$c"
     done
     printf '#!/bin/sh\necho "pve-manager/9.1.2/abc (running kernel: 6.17.2-1-pve)"\n' >"$B/pveversion"
+    printf '#!/bin/sh\n[ -n "$NO_KVMGT" ] && exit 1\necho /lib/modules/x/kvmgt.ko\n' >"$B/modinfo"
     printf '#!/bin/sh\n[ "$3" = pve-qemu-kvm ] && echo "${QEMU_VER:-11.1.3-4}"\n' >"$B/dpkg-query"
     printf '#!/bin/sh\n[ "$1" = showhold ] && printf "pve-qemu-kvm\\npve-edk2-firmware-ovmf\\n"\nexit 0\n' >"$B/apt-mark"
     cat >"$B/apt-get" <<'EOF'
@@ -83,7 +84,7 @@ EOF
     chmod +x "$B"/*
     mkdir -p "$W/bios"; printf '# test catalog\n' >"$W/bios/catalog.tsv"; : >"$W/bios/SHA256SUMS"
     export PATH="$B:$PATH" PIG_ROOT="$R" LOG_LEVEL=normal LOG_FILE="$W/tool.log" PIG_ROMS_DIR="$W/bios"
-    unset QM_FAIL_KEY APT_SIM_BAD QEMU_VER
+    unset QM_FAIL_KEY APT_SIM_BAD QEMU_VER NO_KVMGT
 }
 teardown() { rm -rf "$W"; }
 
@@ -466,10 +467,11 @@ assert_eq "$(key 101 hostpci0)" "0000:00:02.1,pcie=1"
 assert_not "$(cat "$R/etc/default/grub")" "module_blacklist=xe" "no i915 params when xe already offers VFs"
 teardown
 
-T="no-sriov-generation"; setup
-echo 0x3e92 >"$R/sys/bus/pci/devices/0000:00:02.0/device"   # Coffee Lake
+T="no-vgpu-generation"; setup
+echo 0x8a52 >"$R/sys/bus/pci/devices/0000:00:02.0/device"   # Ice Lake: neither
 tool --mode vgpu --yes; assert_eq "$?" 1
-assert_contains "$(cat "$W/err")" "has no SR-IOV"
+assert_contains "$(cat "$W/err")" "neither GVT-g"
+assert_contains "$(tool --mode check)" "only passthrough"
 teardown
 
 # ---------------------------------------------------------------- misc paths
@@ -511,6 +513,218 @@ assert_contains "$(cat "$W/err")" "[ERROR]" "errors always shown"
 LOG_LEVEL=debug tool --mode check >/dev/null
 assert_contains "$(cat "$W/tool.log")" "[DEBUG]"
 tool --mode check --log loud; assert_eq "$?" 2
+teardown
+
+# ---------------------------------------------------------------- GVT-g (Gen8-9)
+gvthost() {   # coffee lake + mdev types "TYPE:avail ..."
+    local d="$R/sys/bus/pci/devices/0000:00:02.0" spec t a
+    echo 0x3e92 >"$d/device"
+    for spec in "$@"; do
+        t="${spec%%:*}"; a="${spec#*:}"
+        mkdir -p "$d/mdev_supported_types/$t/devices"
+        echo "$a" >"$d/mdev_supported_types/$t/available_instances"
+        printf 'low_gm_size: 128MB\nhigh_gm_size: 512MB\nresolution: 1920x1200\n' >"$d/mdev_supported_types/$t/description"
+    done
+}
+
+T="gvt-host-pending-reboot"; setup
+echo 0x3e92 >"$R/sys/bus/pci/devices/0000:00:02.0/device"; mkvm 101 ovmf q35 std
+before="$(cat "$W/vms/101.conf")"
+tool --mode vgpu --vmid 101 --guest android --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_contains "$(cat "$R/etc/default/grub")" "intel_iommu=on iommu=pt i915.enable_gvt=1 i915.enable_guc=0"
+assert_contains "$(cat "$R/etc/modules-load.d/pve-intel-gpu.conf")" "kvmgt"
+assert_contains "$(cat "$W/err")" "GVT-g will be available after a reboot"
+assert_contains "$(cat "$W/err")" "--guest android"
+assert_eq "$(cat "$W/vms/101.conf")" "$before" "VM untouched until GVT-g is active"
+assert_contains "$(tool --mode check)" "vGPU technology: GVT-g"
+teardown
+
+T="gvt-no-kvmgt"; setup
+echo 0x3e92 >"$R/sys/bus/pci/devices/0000:00:02.0/device"
+before="$(hosttree)"
+NO_KVMGT=1 tool --mode vgpu --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "no kvmgt module"
+assert_eq "$(hosttree | grep -v 'var/lib/pve-intel-gpu')" "$(grep -v 'var/lib/pve-intel-gpu' <<<"$before")"
+teardown
+
+T="gvt-android-blissos"; setup
+gvthost i915-GVTg_V5_4:2 i915-GVTg_V5_8:4
+mkvm 101 ovmf q35 std "$REALPC_ARGS"
+tool --mode vgpu --vmid 101 --guest android --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_eq "$(key 101 hostpci0)" "0000:00:02.0,mdev=i915-GVTg_V5_4"
+a="$(key 101 args)"
+assert_contains "$a" "$REALPC_ARGS" "realpc args kept"
+assert_contains "$a" "-set device.hostpci0.x-igd-opregion=on -set device.hostpci0.display=on -set device.hostpci0.ramfb=on -set device.hostpci0.driver=vfio-pci-nohotplug"
+assert_contains "$a" "-display egl-headless,rendernode=/dev/dri/by-path/pci-0000:00:02.0-render"
+assert_eq "$(key 101 vga)" "none" "the vGPU is the screen"
+assert_contains "$(cat "$R/etc/pve-host-tools/args.d/101/50-pve-intel-gpu.args")" "display=on"
+assert_contains "$(cat "$W/err")" "FFMPEG_CODEC2_PREFER=1"
+assert_contains "$(cat "$W/err")" "noVNC"
+out="$(tool --mode check)"
+assert_contains "$out" "VM 101: GVT-g vGPU"
+assert_contains "$out" "i915-GVTg_V5_4: 2 free of 2, 1920x1200, configured in 1 VM(s)"
+# idempotent
+: >"$W/calls"; tool --mode vgpu --vmid 101 --guest android --yes
+assert_not "$(cat "$W/calls")" "qm set"
+teardown
+
+T="gvt-capacity-next-type"; setup
+gvthost i915-GVTg_V5_4:1 i915-GVTg_V5_8:2
+mkvm 101 ovmf q35 std; mkvm 102 ovmf q35 std; mkvm 103 ovmf q35 std; mkvm 104 ovmf q35 std
+tool --mode vgpu --vmid 101 --yes; assert_eq "$(key 101 hostpci0)" "0000:00:02.0,mdev=i915-GVTg_V5_4"
+tool --mode vgpu --vmid 102 --yes; assert_eq "$(key 102 hostpci0)" "0000:00:02.0,mdev=i915-GVTg_V5_8" "V5_4 full -> V5_8"
+tool --mode vgpu --vmid 103 --yes; assert_eq "$(key 103 hostpci0)" "0000:00:02.0,mdev=i915-GVTg_V5_8"
+tool --mode vgpu --vmid 104 --yes; assert_eq "$?" 1 "no free slot"
+assert_contains "$(cat "$W/err")" "No free GVT-g slot"
+tool --mode vgpu --vmid 104 --gvt-type i915-GVTg_V5_8 --yes; assert_eq "$?" 0 "explicit type allowed with a warning"
+assert_contains "$(cat "$W/err")" "cannot all run at once"
+tool --mode vgpu --vmid 104 --gvt-type i915-GVTg_V9_9 --yes; assert_eq "$?" 1
+teardown
+
+T="gvt-windows-console"; setup
+gvthost i915-GVTg_V5_4:2
+mkvm 101 ovmf q35 std "$REALPC_ARGS"
+tool --mode vgpu --vmid 101 --guest windows --yes; assert_eq "$?" 0
+assert_eq "$(key 101 vga)" "std" "console display keeps vga"
+assert_not "$(key 101 args)" "display=on"
+assert_contains "$(key 101 args)" "x-igd-opregion=on"
+teardown
+
+T="gvt-revert-restores"; setup
+gvthost i915-GVTg_V5_4:2
+mkvm 101 ovmf q35 std "$REALPC_ARGS"; orig="$(cat "$W/vms/101.conf")"
+tool --mode vgpu --vmid 101 --guest android --yes
+tool --mode revert --vmid 101 --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_eq "$(sort "$W/vms/101.conf")" "$(sort <<<"$orig")"
+assert_nofile "$R/etc/pve-host-tools/args.d/101/50-pve-intel-gpu.args"
+tool --mode revert --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_not "$(cat "$R/etc/default/grub")" "enable_gvt"
+assert_nofile "$R/etc/modules-load.d/pve-intel-gpu.conf"
+teardown
+
+T="gvt-reapply-after-configvm"; setup
+gvthost i915-GVTg_V5_4:2
+mkvm 101 ovmf q35 std "$REALPC_ARGS"
+tool --mode vgpu --vmid 101 --guest android --yes
+"$B/qm" set 101 --args "$REALPC_ARGS" --vga std
+out="$(tool --mode check)"
+assert_contains "$out" "vGPU args are missing"
+assert_contains "$out" "expected none for the vGPU screen"
+tool --mode reapply --vmid 101; assert_eq "$?" 0
+assert_contains "$(key 101 args)" "egl-headless"
+assert_eq "$(key 101 vga)" none
+# duplicated -display (realpc rollback before the contract covered it) is detected and fixed
+"$B/qm" set 101 --args "$(key 101 args) -display egl-headless,rendernode=/dev/dri/by-path/pci-0000:00:02.0-render"
+assert_contains "$(tool --mode check)" "appears twice"
+tool --mode reapply --vmid 101
+assert_eq "$(grep -o -- '-display egl' <<<"$(key 101 args)" | wc -l | tr -d ' ')" 1
+teardown
+
+T="gvt-blocks-passthrough"; setup
+gvthost i915-GVTg_V5_4:2
+mkvm 101 ovmf q35 std; mkvm 102 ovmf q35 std; mkrom r.rom
+tool --mode vgpu --vmid 101 --yes
+tool --mode passthrough --vmid 102 --rom "$W/r.rom" --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "GVT-g is configured"
+tool --mode passthrough --vmid 101 --rom "$W/r.rom" --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "has a GVT-g vGPU"
+teardown
+
+T="sriov-android-warning"; setup
+vfhost 0; mkvm 101 ovmf q35 std
+tool --mode vgpu --vmid 101 --guest android --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_contains "$(cat "$W/err")" "SR-IOV VF driver"
+assert_eq "$(key 101 vga)" "std" "VF: console vga kept"
+teardown
+
+T="arg-validation-vgpu"; setup
+tool --mode vgpu --guest ios; assert_eq "$?" 2
+tool --mode vgpu --display fancy; assert_eq "$?" 2
+teardown
+
+# ---------------------------------------------------------------- install.sh
+INST="$HERE/../install.sh"
+inst() { PIG_INSTALL_ROOT="$R" bash "$INST" "$@" 2>"$W/err"; }
+
+T="install-from-checkout"; setup
+inst --from "$HERE/.." --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_file "$R/opt/pve-intel-gpu/pve-intel-gpu.sh"
+assert_file "$R/opt/pve-intel-gpu/install.sh"
+assert_file "$R/opt/pve-intel-gpu/bios/SHA256SUMS"
+assert_eq "$(cat "$R/opt/pve-intel-gpu/VERSION")" "$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$TOOL")"
+assert_eq "$(readlink "$R/usr/local/sbin/pve-intel-gpu")" "$R/opt/pve-intel-gpu/pve-intel-gpu.sh"
+assert_contains "$(cat "$W/err")" "realpc-clean-build: not installed"
+# the installed command works and finds its bios/ catalog
+out="$(env -u PIG_ROMS_DIR bash "$R/usr/local/sbin/pve-intel-gpu" --mode status 2>/dev/null)"
+assert_contains "$out" "checksum OK"
+assert_nofile "$R/etc/default/grub.changed" ; assert_contains "$(cat "$R/etc/default/grub")" '"quiet"' "installer never touches kernel params"
+teardown
+
+T="install-from-release-files"; setup
+rel="$W/rel"; bash "$HERE/../tools/stage-release.sh" "$rel"
+echo "CONTRACT_VERSION=1" >"$R/root/realpc/.realpc-state"
+inst --from "$rel" --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_contains "$(cat "$R/opt/pve-intel-gpu/SOURCE")" "files in"
+assert_contains "$(cat "$W/err")" "contract v1 matches"
+assert_eq "$(cd "$R/opt/pve-intel-gpu/bios" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1; echo $?)" 0
+teardown
+
+T="install-refuses-tampered-release"; setup
+rel="$W/rel"; bash "$HERE/../tools/stage-release.sh" "$rel"
+inst --from "$HERE/.." --yes; v1="$(sha256sum <"$R/opt/pve-intel-gpu/pve-intel-gpu.sh")"
+printf 'x' >>"$rel/catalog.tsv"
+inst --mode update --from "$rel" --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "do not match SHA256SUMS"
+assert_eq "$(sha256sum <"$R/opt/pve-intel-gpu/pve-intel-gpu.sh")" "$v1" "old installation intact"
+teardown
+
+T="install-update-keeps-log"; setup
+inst --mode update --from "$HERE/.." --yes; assert_eq "$?" 1 "nothing to update"
+inst --from "$HERE/.." --yes
+echo "old log line" >"$R/opt/pve-intel-gpu/pve-intel-gpu.log"
+inst --mode update --from "$HERE/.." --yes; assert_eq "$?" 0 "$(cat "$W/err")"
+assert_contains "$(cat "$R/opt/pve-intel-gpu/pve-intel-gpu.log")" "old log line"
+assert_eq "$(find "$R/opt" -maxdepth 1 -name 'pve-intel-gpu.old.*' | wc -l | tr -d ' ')" 0 "no leftovers"
+teardown
+
+T="install-contract-warnings"; setup
+echo "INSTALL_MODE=strong" >"$R/root/realpc/.realpc-state"
+inst --from "$HERE/.." --yes
+assert_contains "$(cat "$W/err")" "without the host-tools contract"
+echo "CONTRACT_VERSION=2" >>"$R/root/realpc/.realpc-state"
+inst --mode update --from "$HERE/.." --yes
+assert_contains "$(cat "$W/err")" "Contract mismatch"
+teardown
+
+T="install-lock"; setup
+mkdir -p "$R/run/lock"
+( exec 9>"$R/run/lock/pve-host-tools.lock"; flock 9; sleep 4 ) &
+sleep 0.5
+PIG_LOCK_TIMEOUT=1 inst --from "$HERE/.." --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "holds"
+assert_nofile "$R/opt/pve-intel-gpu"
+wait
+teardown
+
+T="uninstall-guarded"; setup
+inst --from "$HERE/.." --yes
+mkdir -p "$R/var/lib/pve-intel-gpu"; echo "HOST_MODE=vgpu" >"$R/var/lib/pve-intel-gpu/state"
+inst --mode uninstall --yes; assert_eq "$?" 1
+assert_contains "$(cat "$W/err")" "Host changes are still active"
+assert_file "$R/opt/pve-intel-gpu/pve-intel-gpu.sh"
+inst --mode uninstall --force --yes; assert_eq "$?" 0
+assert_nofile "$R/opt/pve-intel-gpu"; assert_nofile "$R/usr/local/sbin/pve-intel-gpu"
+assert_file "$R/var/lib/pve-intel-gpu/state" "state kept with --force"
+teardown
+
+T="uninstall-clean"; setup
+inst --from "$HERE/.." --yes
+inst --mode check; assert_contains "$(cat "$W/err")" "bios/ checksums OK"
+inst --mode uninstall --yes; assert_eq "$?" 0
+assert_nofile "$R/opt/pve-intel-gpu"
+inst --mode check; assert_contains "$(cat "$W/err")" "not installed"
+inst --mode bogus; assert_eq "$?" 2
+inst --release main; assert_eq "$?" 2
 teardown
 
 echo "passed: $PASS, failed: $FAIL"

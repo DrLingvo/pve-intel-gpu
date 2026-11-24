@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: shellcheck
-        run: shellcheck pve-intel-gpu.sh tests/run.sh
+        run: shellcheck pve-intel-gpu.sh install.sh tools/stage-release.sh tests/run.sh
       - name: bios/ checksums
         run: cd bios && sha256sum -c SHA256SUMS
       - name: Offline tests
