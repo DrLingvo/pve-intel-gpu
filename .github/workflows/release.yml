@@ -1,10 +1,18 @@
 name: release
 
-# Push a tag v* to publish a release: tests first, then the script, bios/ and
-# CONTRACT.md with one SHA256SUMS for everything.
+# Publish a release: push a tag v*, or run this workflow from the Actions tab with a
+# tag name. Tests run first; then the script, install.sh, bios/ and CONTRACT.md are
+# published with one SHA256SUMS. An existing release (for example created in the
+# GitHub UI) gets the verified files attached instead.
 on:
   push:
     tags: ['v*']
+  # One click from the Actions tab (main): tests, then the release for this commit.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'release tag, must match VERSION in pve-intel-gpu.sh (e.g. v0.3.0)'
+        required: true
 
 permissions:
   contents: write
@@ -23,7 +31,9 @@ jobs:
       - name: Version matches the tag
         run: |
           v=$(sed -n 's/^VERSION="\(.*\)"/\1/p' pve-intel-gpu.sh)
-          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "VERSION=$v does not match tag $GITHUB_REF_NAME" >&2; exit 1; }
+          tag="${{ github.event.inputs.tag }}"; tag="${tag:-$GITHUB_REF_NAME}"
+          [ "v$v" = "$tag" ] || { echo "VERSION=$v does not match tag $tag" >&2; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - name: Stage files
         run: |
           bash tools/stage-release.sh rel
@@ -34,7 +44,7 @@ jobs:
         run: |
           contract=$(cat rel/CONTRACT_VERSION)
           notes=$(cat <<EOF
-          pve-intel-gpu ${GITHUB_REF_NAME}: Intel iGPU on Proxmox VE (SR-IOV vGPU and full passthrough).
+          pve-intel-gpu ${TAG}: Intel iGPU on Proxmox VE (vGPU via GVT-g or SR-IOV, full passthrough).
 
           Host-tools contract v${contract} (CONTRACT.md). Use together with a realpc-clean-build
           release whose state records CONTRACT_VERSION=${contract}; older realpc releases work too,
@@ -44,12 +54,16 @@ jobs:
           SR-IOV on Gen12+ (Tiger Lake..Core Ultra). BlissOS: --guest android.
 
           Install on the Proxmox host (verifies SHA256SUMS, takes the shared host-tools lock):
-            curl -fsSLO https://github.com/DrLingvo/pve-intel-gpu/releases/download/${GITHUB_REF_NAME}/install.sh
-            bash install.sh --release ${GITHUB_REF_NAME} --yes
+            curl -fsSLO https://github.com/DrLingvo/pve-intel-gpu/releases/download/${TAG}/install.sh
+            bash install.sh --release ${TAG} --yes
             pve-intel-gpu --mode status
             pve-intel-gpu --mode vgpu --vmid N --guest android
 
           Not yet tested on real hardware: start with --mode status and --dry-run.
           EOF
           )
-          gh release create "$GITHUB_REF_NAME" rel/* -R "$GITHUB_REPOSITORY" -t "$GITHUB_REF_NAME" -n "$notes"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" rel/* -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" rel/* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" -t "$TAG" -n "$notes"
+          fi
